@@ -24,6 +24,7 @@ import org.curtinfrc.frc2026.drive.GyroIOPigeon2;
 import org.curtinfrc.frc2026.drive.ModuleIO;
 import org.curtinfrc.frc2026.drive.ModuleIOSim;
 import org.curtinfrc.frc2026.drive.ModuleIOTalonFX;
+import org.curtinfrc.frc2026.drive.Superstructure.Superstructure;
 import org.curtinfrc.frc2026.drive.TunerConstants;
 import org.curtinfrc.frc2026.util.PhoenixUtil;
 import org.curtinfrc.frc2026.util.VirtualSubsystem;
@@ -47,6 +48,7 @@ import org.littletonrobotics.junction.wpilog.WPILOGWriter;
 public class Robot extends LoggedRobot {
   private Drive drive;
   private Vision vision;
+  private Superstructure superstructure = new Superstructure();
   private final CommandXboxController controller = new CommandXboxController(0);
   private final Alert controllerDisconnected =
       new Alert("Driver controller disconnected!", AlertType.kError);
@@ -156,7 +158,9 @@ public class Robot extends LoggedRobot {
     DriverStation.silenceJoystickConnectionWarning(true);
 
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
-
+    superstructure.setDefaultCommand(superstructure.stop());
+    controller.leftTrigger().whileTrue(superstructure.intake());
+    controller.rightTrigger().whileTrue(superstructure.shooter());
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> -controller.getLeftY(),
