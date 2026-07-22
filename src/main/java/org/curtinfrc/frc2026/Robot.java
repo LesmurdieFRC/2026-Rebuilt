@@ -160,7 +160,7 @@ public class Robot extends LoggedRobot {
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
     superstructure.setDefaultCommand(superstructure.stop());
     controller.leftTrigger().whileTrue(superstructure.intake());
-    controller.rightTrigger().whileTrue(superstructure.shooter());
+    controller.rightTrigger().whileTrue(superstructure.shooter(1400));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> -controller.getLeftY(),
