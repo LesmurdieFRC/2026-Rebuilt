@@ -2,16 +2,20 @@ package org.curtinfrc.frc2026;
 
 import static org.curtinfrc.frc2026.vision.Vision.cameraConfigs;
 
+import choreo.auto.AutoChooser;
+import choreo.auto.AutoFactory;
 import edu.wpi.first.net.WebServer;
 import edu.wpi.first.wpilibj.Alert;
 import edu.wpi.first.wpilibj.Alert.AlertType;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.Filesystem;
 import edu.wpi.first.wpilibj.Threads;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
 import edu.wpi.first.wpilibj2.command.Subsystem;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
+import edu.wpi.first.wpilibj2.command.button.RobotModeTriggers;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -50,8 +54,11 @@ public class Robot extends LoggedRobot {
   private Vision vision;
   private Superstructure superstructure = new Superstructure();
   private final CommandXboxController controller = new CommandXboxController(0);
+  private final CommandXboxController controller2 = new CommandXboxController(1);
   private final Alert controllerDisconnected =
       new Alert("Driver controller disconnected!", AlertType.kError);
+  private final AutoChooser autoChooser;
+  private final AutoFactory autoFactory;
 
   public Robot() {
     Logger.recordMetadata("ProjectName", BuildConstants.MAVEN_NAME);
@@ -99,7 +106,13 @@ public class Robot extends LoggedRobot {
                   drive::addVisionMeasurement,
                   drive::getRotation,
                   new VisionIOPhotonVision(
-                      cameraConfigs[0].name(), cameraConfigs[0].robotToCamera()));
+                      cameraConfigs[0].name(), cameraConfigs[0].robotToCamera()),
+                  new VisionIOPhotonVision(
+                      cameraConfigs[1].name(), cameraConfigs[1].robotToCamera()),
+                  new VisionIOPhotonVision(
+                      cameraConfigs[2].name(), cameraConfigs[2].robotToCamera()),
+                  new VisionIOPhotonVision(
+                      cameraConfigs[3].name(), cameraConfigs[3].robotToCamera()));
         }
         case DEV -> {
           drive =
@@ -159,13 +172,32 @@ public class Robot extends LoggedRobot {
 
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
     superstructure.setDefaultCommand(superstructure.stop());
-    controller.leftTrigger().whileTrue(superstructure.intake());
-    controller.rightTrigger().whileTrue(superstructure.shooter(1400));
+    controller2.leftTrigger().whileTrue(superstructure.intake());
+    controller2.rightTrigger().whileTrue(superstructure.shooter(1400));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> -controller.getLeftY(),
             () -> -controller.getLeftX(),
             () -> -controller.getRightX()));
+    controller.y().whileTrue(drive.hubCommand());
+    // controller.y().onTrue(Commands.run(() -> drive.setPose(new Pose2d(0,0, Rotation2d.kZero))));
+    autoChooser = new AutoChooser();
+    autoFactory =
+        new AutoFactory(
+            drive::getPose, // A function that returns the current robot pose
+            drive::setPose, // A function that resets the current robot pose to the provided Pose2d
+            drive::followTrajectory, // The drive subsystem trajectory follower
+            true, // If alliance flipping should be enabled
+            drive // The drive subsystem
+            );
+    // Add options to the chooser
+    autoChooser.addCmd("Auto", () -> autoFactory.trajectoryCmd("Auto"));
+
+    // Put the auto chooser on the dashboard
+    SmartDashboard.putData(autoChooser);
+
+    // Schedule the selected auto during the autonomous period
+    RobotModeTriggers.autonomous().whileTrue(autoChooser.selectedCommandScheduler());
   }
 
   /** This function is called periodically during all modes. */

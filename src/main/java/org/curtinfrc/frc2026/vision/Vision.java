@@ -30,27 +30,22 @@ public class Vision extends VirtualSubsystem {
   public static CameraConfig[] cameraConfigs =
       new CameraConfig[] {
         new CameraConfig(
-            "Intake Left",
-            new Transform3d(
-                new Translation3d(0.293052, 0.2893110, 0.445512),
-                new Rotation3d(0, -0.20944, 0.436332)),
+            "1",
+            new Transform3d(new Translation3d(-0.32, 0.27, 0.47), new Rotation3d(Math.PI, -0, 0)),
             2.0),
         new CameraConfig(
-            "Intake Right",
-            new Transform3d(
-                new Translation3d(0.293302, -0.289311, 0.445512),
-                new Rotation3d(0, -0.20944, -0.436332)),
+            "2",
+            new Transform3d(new Translation3d(-0.32, -0.27, 0.47), new Rotation3d(Math.PI, -0, -0)),
             1.0),
         new CameraConfig(
-            "Shooter Right",
+            "3",
             new Transform3d(
-                new Translation3d(-0.292205, 0.474879, 0.041151),
-                new Rotation3d(0, 0.20944, 2.61799)),
+                new Translation3d(0.32, 0.23, 0.47), new Rotation3d(Math.PI, 0, Math.PI)),
             1.0),
         new CameraConfig(
-            "PC_Camera",
+            "4",
             new Transform3d(
-                new Translation3d(0.291955, 0.474879, -0.041151), new Rotation3d(0, 40, 135)),
+                new Translation3d(0.32, -0.23, 0.47), new Rotation3d(Math.PI, 0, Math.PI)),
             1.0),
       };
 
