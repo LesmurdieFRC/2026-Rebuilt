@@ -54,7 +54,6 @@ public class Robot extends LoggedRobot {
   private Vision vision;
   private Superstructure superstructure = new Superstructure();
   private final CommandXboxController controller = new CommandXboxController(0);
-  private final CommandXboxController controller2 = new CommandXboxController(1);
   private final Alert controllerDisconnected =
       new Alert("Driver controller disconnected!", AlertType.kError);
   private final AutoChooser autoChooser;
@@ -172,8 +171,8 @@ public class Robot extends LoggedRobot {
 
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
     superstructure.setDefaultCommand(superstructure.stop());
-    controller2.leftTrigger().whileTrue(superstructure.intake());
-    controller2.rightTrigger().whileTrue(superstructure.shooter(1400));
+    controller.leftTrigger().whileTrue(superstructure.intake());
+    controller.rightTrigger().whileTrue(superstructure.shooter(1400));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> -controller.getLeftY(),
