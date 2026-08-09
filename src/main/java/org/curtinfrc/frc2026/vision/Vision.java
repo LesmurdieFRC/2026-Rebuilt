@@ -13,7 +13,7 @@ import edu.wpi.first.math.geometry.Translation3d;
 import edu.wpi.first.math.interpolation.TimeInterpolatableBuffer;
 import edu.wpi.first.math.numbers.N1;
 import edu.wpi.first.math.numbers.N3;
-import edu.wpi.first.wpilibj.RobotController;
+import edu.wpi.first.wpilibj.Timer;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.function.Supplier;
@@ -90,7 +90,7 @@ public class Vision extends VirtualSubsystem {
   @Override
   public void periodic() {
     // Update heading data
-    headingBuffer.addSample(RobotController.getTime(), gyro.get());
+    headingBuffer.addSample(Timer.getFPGATimestamp(), gyro.get());
 
     for (int i = 0; i < io.length; i++) {
       io[i].updateInputs(inputs[i]);
@@ -122,7 +122,7 @@ public class Vision extends VirtualSubsystem {
 
       // Loop over pose observations
       for (var observation : inputs[cameraIndex].poseObservations) {
-        var rotation = headingBuffer.getSample(observation.timestamp()).get();
+        var rotation = headingBuffer.getSample(observation.timestamp());
         var pose = observation.pose();
         // Check whether to reject pose
         boolean rejectPose =
@@ -134,11 +134,15 @@ public class Vision extends VirtualSubsystem {
                 || pose.getY() < 0.0
                 || pose.getY() > aprilTagLayout.getFieldWidth()
                 // If the measurement is high ambiguity check it against the gyro
-                || ((observation.tagCount() == 1 && observation.ambiguity() > maxAmbiguity)
-                    && !(Math.abs(pose.getRotation().toRotation2d().minus(rotation).getDegrees())
-                            < 5
-                        && Math.signum(rotation.getDegrees())
-                            == Math.signum(pose.toPose2d().getRotation().getDegrees())));
+                || (observation.tagCount() == 1
+                    && observation.ambiguity() > maxAmbiguity
+                    && (rotation.isEmpty()
+                        || Math.abs(
+                                pose.getRotation()
+                                    .toRotation2d()
+                                    .minus(rotation.get())
+                                    .getDegrees())
+                            >= 5));
 
         // Add pose to log
         robotPoses.add(observation.pose());

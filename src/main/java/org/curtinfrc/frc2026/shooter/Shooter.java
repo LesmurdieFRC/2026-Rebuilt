@@ -1,0 +1,224 @@
+package org.curtinfrc.frc2026.shooter;
+
+import com.revrobotics.RelativeEncoder;
+import com.revrobotics.spark.SparkLowLevel.MotorType;
+import com.revrobotics.spark.SparkMax;
+import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.math.controller.PIDController;
+import edu.wpi.first.math.controller.SimpleMotorFeedforward;
+import edu.wpi.first.math.interpolation.InterpolatingDoubleTreeMap;
+import edu.wpi.first.wpilibj.Timer;
+import edu.wpi.first.wpilibj2.command.Command;
+import edu.wpi.first.wpilibj2.command.FunctionalCommand;
+import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import java.util.function.DoubleSupplier;
+import org.littletonrobotics.junction.Logger;
+
+/** Controls the flywheel and its final feeder roller. */
+public class Shooter extends SubsystemBase {
+  private static final int FEEDER_MOTOR_ID = 4;
+  private static final int FLYWHEEL_MOTOR_ID = 5;
+
+  private static final double FEEDER_STAGE_RPM = 1000.0;
+  private static final double FEEDER_SHOOT_RPM = -3000.0;
+  private static final double INTAKE_FLYWHEEL_RPM = 1400.0;
+  private static final double TWO_METER_FLYWHEEL_RPM = 1400.0;
+
+  private static final double READY_TOLERANCE_RPM = 50.0;
+  private static final double READY_STABLE_SECONDS = 0.10;
+  private static final double RECOVERY_DROP_RPM = 100.0;
+  private static final double MINIMUM_FEED_SECONDS = 0.10;
+  private static final double MAXIMUM_FEED_SECONDS = 0.20;
+  private static final double RECOVERY_BOOST_VOLTS = 2.0;
+
+  private static final InterpolatingDoubleTreeMap FLYWHEEL_RPM_BY_DISTANCE =
+      new InterpolatingDoubleTreeMap();
+
+  static {
+    FLYWHEEL_RPM_BY_DISTANCE.put(1.0, 1200.0);
+    FLYWHEEL_RPM_BY_DISTANCE.put(2.0, TWO_METER_FLYWHEEL_RPM);
+    FLYWHEEL_RPM_BY_DISTANCE.put(3.0, 1600.0);
+    FLYWHEEL_RPM_BY_DISTANCE.put(4.0, 1800.0);
+    FLYWHEEL_RPM_BY_DISTANCE.put(5.0, 2000.0);
+    FLYWHEEL_RPM_BY_DISTANCE.put(6.0, 2200.0);
+  }
+
+  private final SparkMax feederMotor = new SparkMax(FEEDER_MOTOR_ID, MotorType.kBrushless);
+  private final SparkMax flywheelMotor = new SparkMax(FLYWHEEL_MOTOR_ID, MotorType.kBrushless);
+  private final RelativeEncoder feederEncoder = feederMotor.getEncoder();
+  private final RelativeEncoder flywheelEncoder = flywheelMotor.getEncoder();
+
+  private final PIDController feederVelocityController = new PIDController(0.0003, 0.0, 0.0);
+  private final PIDController flywheelVelocityController = new PIDController(0.0009, 0.0, 0.0);
+  private final SimpleMotorFeedforward feederFeedforward = new SimpleMotorFeedforward(0.15, 0.0019);
+  private final SimpleMotorFeedforward flywheelFeedforward =
+      new SimpleMotorFeedforward(0.45, 0.004);
+
+  private double feederTargetRpm;
+  private double flywheelTargetRpm;
+  private double previousFeederTargetRpm;
+  private double previousFlywheelTargetRpm;
+  private double feederCommandedVolts;
+  private double flywheelCommandedVolts;
+  private double flywheelRecoveryBoostVolts;
+  private double distanceMeters = Double.NaN;
+  private double lastRecoverySeconds;
+  private double recoveryStartedSeconds = Double.NaN;
+  private int completedFeedPulses;
+  private boolean atSpeed;
+  private boolean feedingShot;
+  private String sequenceState = "Stopped";
+
+  /** Runs the existing intake/staging behavior until the command is cancelled. */
+  public Command intake() {
+    return runEnd(
+            () -> {
+              sequenceState = "Intaking";
+              setFeederVelocity(FEEDER_STAGE_RPM);
+              setFlywheelVelocity(INTAKE_FLYWHEEL_RPM, false);
+            },
+            this::stopMotors)
+        .withName("Intake");
+  }
+
+  /** Continuously meters shots while held, waiting for flywheel recovery between feeder pulses. */
+  public Command shoot(DoubleSupplier distanceSupplier) {
+    return createShootCommand(distanceSupplier, 0).withName("Shoot Continuously");
+  }
+
+  /** Meters a requested number of feeder pulses, waiting for recovery between each pulse. */
+  public Command shootBurst(DoubleSupplier distanceSupplier, int feedPulses) {
+    if (feedPulses <= 0) {
+      throw new IllegalArgumentException("feedPulses must be positive");
+    }
+    return createShootCommand(distanceSupplier, feedPulses)
+        .withName("Shoot " + feedPulses + " Pulse Burst");
+  }
+
+  private Command createShootCommand(DoubleSupplier distanceSupplier, int requestedPulses) {
+    SensorlessShotSequencer sequencer =
+        new SensorlessShotSequencer(
+            READY_TOLERANCE_RPM,
+            READY_STABLE_SECONDS,
+            RECOVERY_DROP_RPM,
+            MINIMUM_FEED_SECONDS,
+            MAXIMUM_FEED_SECONDS,
+            requestedPulses);
+
+    return new FunctionalCommand(
+        () -> {
+          sequencer.reset();
+          recoveryStartedSeconds = Double.NaN;
+          lastRecoverySeconds = 0.0;
+          completedFeedPulses = 0;
+          feedingShot = false;
+        },
+        () -> {
+          double nowSeconds = Timer.getFPGATimestamp();
+          distanceMeters = distanceSupplier.getAsDouble();
+          double targetRpm = flywheelSpeedForDistance(distanceMeters);
+          double measuredRpm = flywheelEncoder.getVelocity();
+          boolean wasFeeding = sequencer.isFeeding();
+          boolean shouldFeed = sequencer.update(nowSeconds, measuredRpm, targetRpm);
+
+          if (wasFeeding && !shouldFeed) {
+            recoveryStartedSeconds = nowSeconds;
+          } else if (!wasFeeding && shouldFeed && Double.isFinite(recoveryStartedSeconds)) {
+            lastRecoverySeconds = nowSeconds - recoveryStartedSeconds;
+            recoveryStartedSeconds = Double.NaN;
+          }
+
+          setFlywheelVelocity(targetRpm, !shouldFeed);
+          setFeederVelocity(shouldFeed ? FEEDER_SHOOT_RPM : FEEDER_STAGE_RPM);
+          feedingShot = shouldFeed;
+          completedFeedPulses = sequencer.getCompletedPulses();
+          sequenceState = sequencer.getState();
+        },
+        interrupted -> stopMotors(),
+        sequencer::isFinished,
+        this);
+  }
+
+  public static double flywheelSpeedForDistance(double distanceMeters) {
+    if (!Double.isFinite(distanceMeters)) {
+      return TWO_METER_FLYWHEEL_RPM;
+    }
+    return FLYWHEEL_RPM_BY_DISTANCE.get(distanceMeters);
+  }
+
+  private void setFeederVelocity(double nextTargetRpm) {
+    feederTargetRpm = nextTargetRpm;
+    feederCommandedVolts =
+        feederVelocityController.calculate(feederEncoder.getVelocity(), nextTargetRpm)
+            + feederFeedforward.calculateWithVelocities(previousFeederTargetRpm, nextTargetRpm);
+    feederCommandedVolts = MathUtil.clamp(feederCommandedVolts, -12.0, 12.0);
+    feederMotor.setVoltage(feederCommandedVolts);
+    previousFeederTargetRpm = nextTargetRpm;
+  }
+
+  private void setFlywheelVelocity(double nextTargetRpm, boolean allowRecoveryBoost) {
+    flywheelTargetRpm = nextTargetRpm;
+    double measuredRpm = flywheelEncoder.getVelocity();
+    flywheelRecoveryBoostVolts =
+        allowRecoveryBoost && measuredRpm < nextTargetRpm - RECOVERY_DROP_RPM
+            ? RECOVERY_BOOST_VOLTS
+            : 0.0;
+    flywheelCommandedVolts =
+        flywheelVelocityController.calculate(measuredRpm, nextTargetRpm)
+            + flywheelFeedforward.calculateWithVelocities(previousFlywheelTargetRpm, nextTargetRpm)
+            + flywheelRecoveryBoostVolts;
+    flywheelCommandedVolts = MathUtil.clamp(flywheelCommandedVolts, -12.0, 12.0);
+    flywheelMotor.setVoltage(flywheelCommandedVolts);
+    previousFlywheelTargetRpm = nextTargetRpm;
+  }
+
+  /** Stops both motors and holds them stopped until this command is interrupted. */
+  public Command stop() {
+    return run(this::stopMotors).withName("Stop Shooter");
+  }
+
+  private void stopMotors() {
+    feederMotor.setVoltage(0.0);
+    flywheelMotor.setVoltage(0.0);
+    feederVelocityController.reset();
+    flywheelVelocityController.reset();
+    feederTargetRpm = 0.0;
+    flywheelTargetRpm = 0.0;
+    previousFeederTargetRpm = 0.0;
+    previousFlywheelTargetRpm = 0.0;
+    feederCommandedVolts = 0.0;
+    flywheelCommandedVolts = 0.0;
+    flywheelRecoveryBoostVolts = 0.0;
+    distanceMeters = Double.NaN;
+    atSpeed = false;
+    feedingShot = false;
+    sequenceState = "Stopped";
+  }
+
+  @Override
+  public void periodic() {
+    double measuredFlywheelRpm = flywheelEncoder.getVelocity();
+    atSpeed =
+        flywheelTargetRpm > 0.0
+            && Math.abs(flywheelTargetRpm - measuredFlywheelRpm) <= READY_TOLERANCE_RPM;
+    Logger.recordOutput("Shooter/Flywheel/TargetRPM", flywheelTargetRpm);
+    Logger.recordOutput("Shooter/Flywheel/MeasuredRPM", measuredFlywheelRpm);
+    Logger.recordOutput("Shooter/Flywheel/ErrorRPM", flywheelTargetRpm - measuredFlywheelRpm);
+    Logger.recordOutput("Shooter/Flywheel/CommandedVolts", flywheelCommandedVolts);
+    Logger.recordOutput("Shooter/Flywheel/RecoveryBoostVolts", flywheelRecoveryBoostVolts);
+    Logger.recordOutput(
+        "Shooter/Flywheel/AppliedVolts",
+        flywheelMotor.getAppliedOutput() * flywheelMotor.getBusVoltage());
+    Logger.recordOutput("Shooter/Flywheel/OutputCurrentAmps", flywheelMotor.getOutputCurrent());
+    Logger.recordOutput("Shooter/Flywheel/BusVoltage", flywheelMotor.getBusVoltage());
+    Logger.recordOutput("Shooter/Feeder/TargetRPM", feederTargetRpm);
+    Logger.recordOutput("Shooter/Feeder/MeasuredRPM", feederEncoder.getVelocity());
+    Logger.recordOutput("Shooter/Feeder/CommandedVolts", feederCommandedVolts);
+    Logger.recordOutput("Shooter/Feeder/FeedingShot", feedingShot);
+    Logger.recordOutput("Shooter/DistanceMeters", distanceMeters);
+    Logger.recordOutput("Shooter/AtSpeed", atSpeed);
+    Logger.recordOutput("Shooter/SequenceState", sequenceState);
+    Logger.recordOutput("Shooter/CompletedFeedPulses", completedFeedPulses);
+    Logger.recordOutput("Shooter/LastRecoverySeconds", lastRecoverySeconds);
+  }
+}

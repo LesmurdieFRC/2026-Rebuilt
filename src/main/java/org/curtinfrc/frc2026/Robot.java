@@ -2,8 +2,6 @@ package org.curtinfrc.frc2026;
 
 import static org.curtinfrc.frc2026.vision.Vision.cameraConfigs;
 
-import choreo.auto.AutoChooser;
-import choreo.auto.AutoFactory;
 import edu.wpi.first.net.WebServer;
 import edu.wpi.first.wpilibj.Alert;
 import edu.wpi.first.wpilibj.Alert.AlertType;
@@ -28,8 +26,8 @@ import org.curtinfrc.frc2026.drive.GyroIOPigeon2;
 import org.curtinfrc.frc2026.drive.ModuleIO;
 import org.curtinfrc.frc2026.drive.ModuleIOSim;
 import org.curtinfrc.frc2026.drive.ModuleIOTalonFX;
-import org.curtinfrc.frc2026.drive.Superstructure.Superstructure;
 import org.curtinfrc.frc2026.drive.TunerConstants;
+import org.curtinfrc.frc2026.shooter.Shooter;
 import org.curtinfrc.frc2026.util.PhoenixUtil;
 import org.curtinfrc.frc2026.util.VirtualSubsystem;
 import org.curtinfrc.frc2026.vision.Vision;
@@ -52,12 +50,11 @@ import org.littletonrobotics.junction.wpilog.WPILOGWriter;
 public class Robot extends LoggedRobot {
   private Drive drive;
   private Vision vision;
-  private Superstructure superstructure = new Superstructure();
+  private final Shooter shooter = new Shooter();
   private final CommandXboxController controller = new CommandXboxController(0);
   private final Alert controllerDisconnected =
       new Alert("Driver controller disconnected!", AlertType.kError);
-  private final AutoChooser autoChooser;
-  private final AutoFactory autoFactory;
+  private final Autos autos;
 
   public Robot() {
     Logger.recordMetadata("ProjectName", BuildConstants.MAVEN_NAME);
@@ -170,9 +167,9 @@ public class Robot extends LoggedRobot {
     DriverStation.silenceJoystickConnectionWarning(true);
 
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
-    superstructure.setDefaultCommand(superstructure.stop());
-    controller.leftTrigger().whileTrue(superstructure.intake());
-    controller.rightTrigger().whileTrue(superstructure.shooter(1400));
+    shooter.setDefaultCommand(shooter.stop());
+    controller.leftTrigger().whileTrue(shooter.intake());
+    controller.rightTrigger().whileTrue(shooter.shoot(drive::getDistanceToAllianceHub));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> -controller.getLeftY(),
@@ -180,23 +177,13 @@ public class Robot extends LoggedRobot {
             () -> -controller.getRightX()));
     controller.y().whileTrue(drive.hubCommand());
     // controller.y().onTrue(Commands.run(() -> drive.setPose(new Pose2d(0,0, Rotation2d.kZero))));
-    autoChooser = new AutoChooser();
-    autoFactory =
-        new AutoFactory(
-            drive::getPose, // A function that returns the current robot pose
-            drive::setPose, // A function that resets the current robot pose to the provided Pose2d
-            drive::followTrajectory, // The drive subsystem trajectory follower
-            true, // If alliance flipping should be enabled
-            drive // The drive subsystem
-            );
-    // Add options to the chooser
-    autoChooser.addCmd("Auto", () -> autoFactory.trajectoryCmd("Auto"));
+    autos = new Autos(drive, shooter);
 
     // Put the auto chooser on the dashboard
-    SmartDashboard.putData(autoChooser);
+    SmartDashboard.putData(autos.getChooser());
 
     // Schedule the selected auto during the autonomous period
-    RobotModeTriggers.autonomous().whileTrue(autoChooser.selectedCommandScheduler());
+    RobotModeTriggers.autonomous().whileTrue(autos.getChooser().selectedCommandScheduler());
   }
 
   /** This function is called periodically during all modes. */

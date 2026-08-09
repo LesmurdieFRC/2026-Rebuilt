@@ -99,15 +99,15 @@ public class Drive extends SubsystemBase {
     Pose2d pose = getPose();
 
     // Generate the next speeds for the robot
-    ChassisSpeeds speeds =
+    ChassisSpeeds fieldRelativeSpeeds =
         new ChassisSpeeds(
             sample.vx + xController.calculate(pose.getX(), sample.x),
             sample.vy + yController.calculate(pose.getY(), sample.y),
             sample.omega
                 + headingController.calculate(pose.getRotation().getRadians(), sample.heading));
 
-    // Apply the generated speeds
-    runVelocity(speeds);
+    // Choreo samples and x/y feedback are field-relative; module setpoints are robot-relative.
+    runVelocity(ChassisSpeeds.fromFieldRelativeSpeeds(fieldRelativeSpeeds, pose.getRotation()));
   }
 
   @Override
@@ -326,15 +326,27 @@ public class Drive extends SubsystemBase {
   public Command hubCommand() {
     return run(
         () -> {
-          Pose2d CurrentPosition = getPose();
-          Translation2d HubPosition = FieldConstants.Hub.topCenterPoint.toTranslation2d();
-          double Opposite = Math.abs(CurrentPosition.getX() - HubPosition.getX());
-          double Adjacent = Math.abs(CurrentPosition.getY() - HubPosition.getY());
-          double Angle = Math.atan2(Opposite, Adjacent);
-          double TurnSpeed =
-              headingController.calculate(CurrentPosition.getRotation().getRadians(), Angle);
-          ChassisSpeeds robotSpeeds = new ChassisSpeeds(0, 0, TurnSpeed);
-          runVelocity(robotSpeeds);
+          Pose2d currentPose = getPose();
+          Translation2d hubPosition = getAllianceHubPosition();
+          Rotation2d targetHeading =
+              HubAiming.headingToTarget(currentPose.getTranslation(), hubPosition);
+          double turnSpeed =
+              headingController.calculate(
+                  currentPose.getRotation().getRadians(), targetHeading.getRadians());
+
+          Logger.recordOutput("Drive/HubAim/Target", hubPosition);
+          Logger.recordOutput("Drive/HubAim/TargetHeading", targetHeading);
+          runVelocity(new ChassisSpeeds(0.0, 0.0, turnSpeed));
         });
+  }
+
+  /** Returns the center of the scoring hub belonging to the current alliance. */
+  public static Translation2d getAllianceHubPosition() {
+    return FieldConstants.Hub.getAllianceCenter(DriverStation.getAlliance().orElse(Alliance.Blue));
+  }
+
+  /** Returns this robot's current planar distance from the center of its alliance hub. */
+  public double getDistanceToAllianceHub() {
+    return getPose().getTranslation().getDistance(getAllianceHubPosition());
   }
 }

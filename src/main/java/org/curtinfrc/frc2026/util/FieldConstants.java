@@ -13,6 +13,7 @@ import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Translation2d;
 import edu.wpi.first.math.geometry.Translation3d;
 import edu.wpi.first.math.util.Units;
+import edu.wpi.first.wpilibj.DriverStation.Alliance;
 import edu.wpi.first.wpilibj.Filesystem;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -113,6 +114,12 @@ public class FieldConstants {
             AprilTagLayoutType.OFFICIAL.getLayout().getTagPose(4).get().getX() + width / 2.0,
             fieldWidth / 2.0,
             height);
+
+    /** Returns the center of the scoring hub belonging to the requested alliance. */
+    public static Translation2d getAllianceCenter(Alliance alliance) {
+      return (alliance == Alliance.Red ? oppTopCenterPoint : topCenterPoint).toTranslation2d();
+    }
+
     public static final Translation2d oppNearLeftCorner =
         new Translation2d(oppTopCenterPoint.getX() - width / 2.0, fieldWidth / 2.0 + width / 2.0);
     public static final Translation2d oppNearRightCorner =
@@ -340,6 +347,7 @@ public class FieldConstants {
               Path p =
                   Path.of(
                       Filesystem.getDeployDirectory().toString(),
+                      "apriltags",
                       fieldType.getJsonFolder(),
                       name + ".json");
               layout = new AprilTagFieldLayout(p);
