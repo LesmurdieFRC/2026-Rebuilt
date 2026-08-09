@@ -27,25 +27,32 @@ public class Vision extends VirtualSubsystem {
 
   public static record CameraConfig(String name, Transform3d robotToCamera, double stdDev) {}
 
+  private static final Rotation3d REAR_HORIZONTAL_CAMERA_ROTATION =
+      new Rotation3d(0.0, 0.0, Math.PI);
+  private static final Rotation3d FRONT_VERTICAL_LEFT_IS_DOWN_ROTATION =
+      new Rotation3d(-Math.PI / 2.0, 0.0, 0.0);
+  private static final Rotation3d FRONT_VERTICAL_LEFT_IS_UP_ROTATION =
+      new Rotation3d(Math.PI / 2.0, 0.0, 0.0);
+
   public static CameraConfig[] cameraConfigs =
       new CameraConfig[] {
         new CameraConfig(
             "1",
-            new Transform3d(new Translation3d(-0.32, 0.27, 0.47), new Rotation3d(Math.PI, -0, 0)),
+            new Transform3d(new Translation3d(-0.32, 0.27, 0.47), REAR_HORIZONTAL_CAMERA_ROTATION),
             2.0),
         new CameraConfig(
             "2",
-            new Transform3d(new Translation3d(-0.32, -0.27, 0.47), new Rotation3d(Math.PI, -0, -0)),
+            new Transform3d(new Translation3d(-0.32, -0.27, 0.47), REAR_HORIZONTAL_CAMERA_ROTATION),
             1.0),
         new CameraConfig(
             "3",
             new Transform3d(
-                new Translation3d(0.32, 0.23, 0.47), new Rotation3d(Math.PI, 0, Math.PI)),
+                new Translation3d(0.32, 0.23, 0.47), FRONT_VERTICAL_LEFT_IS_DOWN_ROTATION),
             1.0),
         new CameraConfig(
             "4",
             new Transform3d(
-                new Translation3d(0.32, -0.23, 0.47), new Rotation3d(Math.PI, 0, Math.PI)),
+                new Translation3d(0.32, -0.23, 0.47), FRONT_VERTICAL_LEFT_IS_UP_ROTATION),
             1.0),
       };
 
