@@ -41,7 +41,7 @@ public class Shooter extends SubsystemBase {
     FLYWHEEL_RPM_BY_DISTANCE.put(1.5, 1275.0);
     FLYWHEEL_RPM_BY_DISTANCE.put(2.0, TWO_METER_FLYWHEEL_RPM);
     FLYWHEEL_RPM_BY_DISTANCE.put(2.5, 1525.0);
-    FLYWHEEL_RPM_BY_DISTANCE.put(3.0, 1650.0);
+    FLYWHEEL_RPM_BY_DISTANCE.put(3.0, 1600.0);
     FLYWHEEL_RPM_BY_DISTANCE.put(3.5, 1775.0);
     FLYWHEEL_RPM_BY_DISTANCE.put(4.0, 1900.0);
     FLYWHEEL_RPM_BY_DISTANCE.put(4.5, 2025.0);
@@ -81,7 +81,7 @@ public class Shooter extends SubsystemBase {
     return runEnd(
             () -> {
               sequenceState = "Intaking";
-              setFeederVelocity(FEEDER_STAGE_RPM);
+              setFeederVelocity(-FEEDER_STAGE_RPM);
               setFlywheelVelocity(INTAKE_FLYWHEEL_RPM, false);
             },
             this::stopMotors)

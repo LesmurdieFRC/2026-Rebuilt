@@ -329,7 +329,8 @@ public class Drive extends SubsystemBase {
           Pose2d currentPose = getPose();
           Translation2d hubPosition = getAllianceHubPosition();
           Rotation2d targetHeading =
-              HubAiming.headingToTarget(currentPose.getTranslation(), hubPosition);
+              HubAiming.headingToTarget(currentPose.getTranslation(), hubPosition)
+                  .rotateBy(new Rotation2d(Math.PI));
           double turnSpeed =
               headingController.calculate(
                   currentPose.getRotation().getRadians(), targetHeading.getRadians());
