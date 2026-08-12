@@ -12,13 +12,13 @@ class ShooterTest {
 
   @Test
   void interpolatesBetweenCalibrationPoints() {
-    assertEquals(1500.0, Shooter.flywheelSpeedForDistance(2.5));
+    assertEquals(1462.5, Shooter.flywheelSpeedForDistance(2.25));
   }
 
   @Test
   void clampsOutsideCalibratedRange() {
-    assertEquals(1200.0, Shooter.flywheelSpeedForDistance(0.5));
-    assertEquals(2200.0, Shooter.flywheelSpeedForDistance(7.0));
+    assertEquals(1175.0, Shooter.flywheelSpeedForDistance(0.5));
+    assertEquals(2350.0, Shooter.flywheelSpeedForDistance(7.0));
   }
 
   @Test
