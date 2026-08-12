@@ -14,6 +14,7 @@ import edu.wpi.first.wpilibj2.command.CommandScheduler;
 import edu.wpi.first.wpilibj2.command.Subsystem;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
 import edu.wpi.first.wpilibj2.command.button.RobotModeTriggers;
+import edu.wpi.first.wpilibj2.command.sysid.SysIdRoutine;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -71,7 +72,7 @@ public class Robot extends LoggedRobot {
 
     switch (Constants.getMode()) {
       case REAL -> {
-        // Logger.addDataReceiver(new WPILOGWriter());
+        Logger.addDataReceiver(new WPILOGWriter());
         Logger.addDataReceiver(new NT4Publisher());
       }
       case SIM -> {
@@ -176,6 +177,7 @@ public class Robot extends LoggedRobot {
             () -> -controller.getLeftX(),
             () -> -controller.getRightX()));
     controller.y().whileTrue(drive.hubCommand());
+    configureShooterSysIdBindings();
     // controller.y().onTrue(Commands.run(() -> drive.setPose(new Pose2d(0,0, Rotation2d.kZero))));
     autos = new Autos(drive, shooter);
 
@@ -184,6 +186,22 @@ public class Robot extends LoggedRobot {
 
     // Schedule the selected auto during the autonomous period
     RobotModeTriggers.autonomous().whileTrue(autos.getChooser().selectedCommandScheduler());
+  }
+
+  private void configureShooterSysIdBindings() {
+    var testMode = RobotModeTriggers.test();
+    testMode
+        .and(controller.povUp())
+        .whileTrue(shooter.flywheelSysIdQuasistatic(SysIdRoutine.Direction.kForward));
+    testMode
+        .and(controller.povDown())
+        .whileTrue(shooter.flywheelSysIdQuasistatic(SysIdRoutine.Direction.kReverse));
+    testMode
+        .and(controller.povRight())
+        .whileTrue(shooter.flywheelSysIdDynamic(SysIdRoutine.Direction.kForward));
+    testMode
+        .and(controller.povLeft())
+        .whileTrue(shooter.flywheelSysIdDynamic(SysIdRoutine.Direction.kReverse));
   }
 
   /** This function is called periodically during all modes. */

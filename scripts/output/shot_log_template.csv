@@ -1,0 +1,1 @@
+distance_m,rpm,angle_deg,exit_speed_mps,spin_rpm,result,recommended_rpm,actual_rpm,actual_angle_deg,yaw_error_deg,entry_angle_deg,flight_time_s,lip_x_m,lip_y_m,distance_error_m,lateral_error_m,exit_height_error_m,robot_vx_error_mps,robot_vy_error_mps,robot_omega_error_deg_s

@@ -1,5 +1,12 @@
 package org.curtinfrc.frc2026.shooter;
 
+import static edu.wpi.first.units.Units.RPM;
+import static edu.wpi.first.units.Units.Rotations;
+import static edu.wpi.first.units.Units.RotationsPerSecond;
+import static edu.wpi.first.units.Units.Second;
+import static edu.wpi.first.units.Units.Seconds;
+import static edu.wpi.first.units.Units.Volts;
+
 import com.revrobotics.RelativeEncoder;
 import com.revrobotics.spark.SparkLowLevel.MotorType;
 import com.revrobotics.spark.SparkMax;
@@ -11,6 +18,7 @@ import edu.wpi.first.wpilibj.Timer;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.FunctionalCommand;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import edu.wpi.first.wpilibj2.command.sysid.SysIdRoutine;
 import java.util.function.DoubleSupplier;
 import org.littletonrobotics.junction.Logger;
 
@@ -27,9 +35,38 @@ public class Shooter extends SubsystemBase {
   private static final double READY_TOLERANCE_RPM = 50.0;
   private static final double READY_STABLE_SECONDS = 0.10;
   private static final double RECOVERY_DROP_RPM = 100.0;
-  private static final double MINIMUM_FEED_SECONDS = 0.10;
+  private static final double SHOT_EVENT_ARMING_SECONDS = 0.04;
   private static final double MAXIMUM_FEED_SECONDS = 0.20;
+  private static final double MINIMUM_SHOT_EVENT_SEPARATION_SECONDS = 0.12;
+  private static final double IMPACT_DECELERATION_RPM_PER_SECOND = -2500.0;
+  private static final double SUPPORTING_DECELERATION_RPM_PER_SECOND = -800.0;
+  private static final double FLYWHEEL_CURRENT_RISE_AMPS = 8.0;
+  private static final double FEEDER_CURRENT_RISE_AMPS = 6.0;
+  private static final double ACCELERATION_FILTER_TIME_CONSTANT_SECONDS = 0.04;
   private static final double RECOVERY_BOOST_VOLTS = 2.0;
+
+  private static final SensorlessShotSequencer.Config SHOT_SEQUENCER_CONFIG =
+      new SensorlessShotSequencer.Config(
+          READY_TOLERANCE_RPM,
+          READY_STABLE_SECONDS,
+          RECOVERY_DROP_RPM,
+          SHOT_EVENT_ARMING_SECONDS,
+          MAXIMUM_FEED_SECONDS,
+          MINIMUM_SHOT_EVENT_SEPARATION_SECONDS,
+          IMPACT_DECELERATION_RPM_PER_SECOND,
+          SUPPORTING_DECELERATION_RPM_PER_SECOND,
+          FLYWHEEL_CURRENT_RISE_AMPS,
+          FEEDER_CURRENT_RISE_AMPS);
+
+  private static final double SYSID_RAMP_VOLTS_PER_SECOND = 1.0;
+  private static final double SYSID_STEP_VOLTS = 6.0;
+  private static final double SYSID_TIMEOUT_SECONDS = 6.0;
+
+  // Flywheel controller units are rotations and seconds so SysId gains can be used directly.
+  private static final double FLYWHEEL_KP_VOLTS_PER_RPS = 0.054;
+  private static final double FLYWHEEL_KS_VOLTS = 0.45;
+  private static final double FLYWHEEL_KV_VOLTS_PER_RPS = 0.24;
+  private static final double FLYWHEEL_KA_VOLTS_PER_RPS_SQUARED = 0.0;
 
   private static final InterpolatingDoubleTreeMap FLYWHEEL_RPM_BY_DISTANCE =
       new InterpolatingDoubleTreeMap();
@@ -55,26 +92,55 @@ public class Shooter extends SubsystemBase {
   private final RelativeEncoder feederEncoder = feederMotor.getEncoder();
   private final RelativeEncoder flywheelEncoder = flywheelMotor.getEncoder();
 
+  private final SysIdRoutine flywheelSysIdRoutine;
+
   private final PIDController feederVelocityController = new PIDController(0.0003, 0.0, 0.0);
-  private final PIDController flywheelVelocityController = new PIDController(0.0009, 0.0, 0.0);
+  private final PIDController flywheelVelocityController =
+      new PIDController(FLYWHEEL_KP_VOLTS_PER_RPS, 0.0, 0.0);
   private final SimpleMotorFeedforward feederFeedforward = new SimpleMotorFeedforward(0.15, 0.0019);
   private final SimpleMotorFeedforward flywheelFeedforward =
-      new SimpleMotorFeedforward(0.45, 0.004);
+      new SimpleMotorFeedforward(
+          FLYWHEEL_KS_VOLTS, FLYWHEEL_KV_VOLTS_PER_RPS, FLYWHEEL_KA_VOLTS_PER_RPS_SQUARED);
 
   private double feederTargetRpm;
   private double flywheelTargetRpm;
   private double previousFeederTargetRpm;
-  private double previousFlywheelTargetRpm;
+  private double previousFlywheelTargetRps;
   private double feederCommandedVolts;
   private double flywheelCommandedVolts;
   private double flywheelRecoveryBoostVolts;
   private double distanceMeters = Double.NaN;
   private double lastRecoverySeconds;
   private double recoveryStartedSeconds = Double.NaN;
+  private double previousVelocitySampleRpm;
+  private double previousVelocitySampleSeconds = Double.NaN;
+  private double rawFlywheelAccelerationRpmPerSecond;
+  private double filteredFlywheelAccelerationRpmPerSecond;
+  private double lastDetectedShotSeconds = Double.NaN;
+  private double lastPulseMinimumRpm;
+  private double lastPulseMaximumDroopRpm;
+  private double lastPulseMaximumFlywheelCurrentAmps;
+  private double lastPulseMaximumFeederCurrentAmps;
+  private double shotDetectionFlywheelCurrentRiseAmps;
+  private double shotDetectionFeederCurrentRiseAmps;
   private int completedFeedPulses;
+  private int estimatedShotEvents;
   private boolean atSpeed;
   private boolean feedingShot;
+  private String lastShotEventReason = "None";
   private String sequenceState = "Stopped";
+
+  public Shooter() {
+    flywheelSysIdRoutine =
+        new SysIdRoutine(
+            new SysIdRoutine.Config(
+                Volts.of(SYSID_RAMP_VOLTS_PER_SECOND).per(Second),
+                Volts.of(SYSID_STEP_VOLTS),
+                Seconds.of(SYSID_TIMEOUT_SECONDS),
+                state -> Logger.recordOutput("Shooter/SysIdState", state.toString())),
+            new SysIdRoutine.Mechanism(
+                this::runFlywheelSysIdVoltage, null, this, "ShooterFlywheel"));
+  }
 
   /** Runs the existing intake/staging behavior until the command is cancelled. */
   public Command intake() {
@@ -102,15 +168,40 @@ public class Shooter extends SubsystemBase {
         .withName("Shoot " + feedPulses + " Pulse Burst");
   }
 
+  /** Runs a slow voltage ramp for flywheel feedforward characterization. */
+  public Command flywheelSysIdQuasistatic(SysIdRoutine.Direction direction) {
+    return flywheelSysIdRoutine
+        .quasistatic(direction)
+        .withName("Flywheel SysId Quasistatic " + directionName(direction));
+  }
+
+  /** Runs a voltage step for flywheel acceleration characterization. */
+  public Command flywheelSysIdDynamic(SysIdRoutine.Direction direction) {
+    return flywheelSysIdRoutine
+        .dynamic(direction)
+        .withName("Flywheel SysId Dynamic " + directionName(direction));
+  }
+
+  private static String directionName(SysIdRoutine.Direction direction) {
+    return direction == SysIdRoutine.Direction.kForward ? "Forward" : "Reverse";
+  }
+
+  private void runFlywheelSysIdVoltage(edu.wpi.first.units.measure.Voltage requestedVoltage) {
+    feederMotor.setVoltage(0.0);
+    feederTargetRpm = 0.0;
+    feederCommandedVolts = 0.0;
+    feedingShot = false;
+
+    flywheelTargetRpm = 0.0;
+    flywheelRecoveryBoostVolts = 0.0;
+    flywheelCommandedVolts = requestedVoltage.in(Volts);
+    flywheelMotor.setVoltage(flywheelCommandedVolts);
+    sequenceState = "SysId";
+  }
+
   private Command createShootCommand(DoubleSupplier distanceSupplier, int requestedPulses) {
     SensorlessShotSequencer sequencer =
-        new SensorlessShotSequencer(
-            READY_TOLERANCE_RPM,
-            READY_STABLE_SECONDS,
-            RECOVERY_DROP_RPM,
-            MINIMUM_FEED_SECONDS,
-            MAXIMUM_FEED_SECONDS,
-            requestedPulses);
+        new SensorlessShotSequencer(SHOT_SEQUENCER_CONFIG, requestedPulses);
 
     return new FunctionalCommand(
         () -> {
@@ -118,15 +209,31 @@ public class Shooter extends SubsystemBase {
           recoveryStartedSeconds = Double.NaN;
           lastRecoverySeconds = 0.0;
           completedFeedPulses = 0;
+          estimatedShotEvents = 0;
           feedingShot = false;
+          lastDetectedShotSeconds = Double.NaN;
+          lastPulseMinimumRpm = 0.0;
+          lastPulseMaximumDroopRpm = 0.0;
+          lastPulseMaximumFlywheelCurrentAmps = 0.0;
+          lastPulseMaximumFeederCurrentAmps = 0.0;
+          shotDetectionFlywheelCurrentRiseAmps = 0.0;
+          shotDetectionFeederCurrentRiseAmps = 0.0;
+          lastShotEventReason = "None";
         },
         () -> {
           double nowSeconds = Timer.getFPGATimestamp();
           distanceMeters = distanceSupplier.getAsDouble();
           double targetRpm = flywheelSpeedForDistance(distanceMeters);
           double measuredRpm = flywheelEncoder.getVelocity();
+          var shotSample =
+              new SensorlessShotSequencer.Sample(
+                  measuredRpm,
+                  targetRpm,
+                  filteredFlywheelAccelerationRpmPerSecond,
+                  flywheelMotor.getOutputCurrent(),
+                  feederMotor.getOutputCurrent());
           boolean wasFeeding = sequencer.isFeeding();
-          boolean shouldFeed = sequencer.update(nowSeconds, measuredRpm, targetRpm);
+          boolean shouldFeed = sequencer.update(nowSeconds, shotSample);
 
           if (wasFeeding && !shouldFeed) {
             recoveryStartedSeconds = nowSeconds;
@@ -139,6 +246,22 @@ public class Shooter extends SubsystemBase {
           setFeederVelocity(shouldFeed ? FEEDER_SHOOT_RPM : FEEDER_STAGE_RPM);
           feedingShot = shouldFeed;
           completedFeedPulses = sequencer.getCompletedPulses();
+          estimatedShotEvents = sequencer.getEstimatedShotEvents();
+          lastDetectedShotSeconds = sequencer.getLastDetectedEventSeconds();
+          lastPulseMinimumRpm = sequencer.getLastPulseMinimumRpm();
+          lastPulseMaximumDroopRpm = sequencer.getLastPulseMaximumDroopRpm();
+          lastPulseMaximumFlywheelCurrentAmps = sequencer.getLastPulseMaximumFlywheelCurrentAmps();
+          lastPulseMaximumFeederCurrentAmps = sequencer.getLastPulseMaximumFeederCurrentAmps();
+          if (shouldFeed || wasFeeding) {
+            shotDetectionFlywheelCurrentRiseAmps =
+                shotSample.flywheelCurrentAmps() - sequencer.getFlywheelCurrentBaselineAmps();
+            shotDetectionFeederCurrentRiseAmps =
+                shotSample.feederCurrentAmps() - sequencer.getFeederCurrentBaselineAmps();
+          } else {
+            shotDetectionFlywheelCurrentRiseAmps = 0.0;
+            shotDetectionFeederCurrentRiseAmps = 0.0;
+          }
+          lastShotEventReason = sequencer.getLastEventReason();
           sequenceState = sequencer.getState();
         },
         interrupted -> stopMotors(),
@@ -166,17 +289,23 @@ public class Shooter extends SubsystemBase {
   private void setFlywheelVelocity(double nextTargetRpm, boolean allowRecoveryBoost) {
     flywheelTargetRpm = nextTargetRpm;
     double measuredRpm = flywheelEncoder.getVelocity();
+    double measuredRps = rpmToRps(measuredRpm);
+    double nextTargetRps = rpmToRps(nextTargetRpm);
     flywheelRecoveryBoostVolts =
         allowRecoveryBoost && measuredRpm < nextTargetRpm - RECOVERY_DROP_RPM
             ? RECOVERY_BOOST_VOLTS
             : 0.0;
     flywheelCommandedVolts =
-        flywheelVelocityController.calculate(measuredRpm, nextTargetRpm)
-            + flywheelFeedforward.calculateWithVelocities(previousFlywheelTargetRpm, nextTargetRpm)
+        flywheelVelocityController.calculate(measuredRps, nextTargetRps)
+            + flywheelFeedforward.calculateWithVelocities(previousFlywheelTargetRps, nextTargetRps)
             + flywheelRecoveryBoostVolts;
     flywheelCommandedVolts = MathUtil.clamp(flywheelCommandedVolts, -12.0, 12.0);
     flywheelMotor.setVoltage(flywheelCommandedVolts);
-    previousFlywheelTargetRpm = nextTargetRpm;
+    previousFlywheelTargetRps = nextTargetRps;
+  }
+
+  private static double rpmToRps(double rpm) {
+    return RPM.of(rpm).in(RotationsPerSecond);
   }
 
   /** Stops both motors and holds them stopped until this command is interrupted. */
@@ -192,7 +321,7 @@ public class Shooter extends SubsystemBase {
     feederTargetRpm = 0.0;
     flywheelTargetRpm = 0.0;
     previousFeederTargetRpm = 0.0;
-    previousFlywheelTargetRpm = 0.0;
+    previousFlywheelTargetRps = 0.0;
     feederCommandedVolts = 0.0;
     flywheelCommandedVolts = 0.0;
     flywheelRecoveryBoostVolts = 0.0;
@@ -204,28 +333,92 @@ public class Shooter extends SubsystemBase {
 
   @Override
   public void periodic() {
+    double nowSeconds = Timer.getFPGATimestamp();
     double measuredFlywheelRpm = flywheelEncoder.getVelocity();
+    updateFlywheelAcceleration(nowSeconds, measuredFlywheelRpm);
+    double measuredFlywheelRps = rpmToRps(measuredFlywheelRpm);
+    double flywheelTargetRps = rpmToRps(flywheelTargetRpm);
     atSpeed =
         flywheelTargetRpm > 0.0
             && Math.abs(flywheelTargetRpm - measuredFlywheelRpm) <= READY_TOLERANCE_RPM;
     Logger.recordOutput("Shooter/Flywheel/TargetRPM", flywheelTargetRpm);
+    Logger.recordOutput("Shooter/Flywheel/TargetRPS", RotationsPerSecond.of(flywheelTargetRps));
+    Logger.recordOutput("Shooter/Flywheel/Position", Rotations.of(flywheelEncoder.getPosition()));
+    Logger.recordOutput("Shooter/Flywheel/Velocity", RotationsPerSecond.of(measuredFlywheelRps));
+    Logger.recordOutput(
+        "Shooter/Flywheel/ErrorRPS",
+        RotationsPerSecond.of(flywheelTargetRps - measuredFlywheelRps));
     Logger.recordOutput("Shooter/Flywheel/MeasuredRPM", measuredFlywheelRpm);
     Logger.recordOutput("Shooter/Flywheel/ErrorRPM", flywheelTargetRpm - measuredFlywheelRpm);
     Logger.recordOutput("Shooter/Flywheel/CommandedVolts", flywheelCommandedVolts);
     Logger.recordOutput("Shooter/Flywheel/RecoveryBoostVolts", flywheelRecoveryBoostVolts);
     Logger.recordOutput(
         "Shooter/Flywheel/AppliedVolts",
-        flywheelMotor.getAppliedOutput() * flywheelMotor.getBusVoltage());
+        Volts.of(flywheelMotor.getAppliedOutput() * flywheelMotor.getBusVoltage()));
     Logger.recordOutput("Shooter/Flywheel/OutputCurrentAmps", flywheelMotor.getOutputCurrent());
+    Logger.recordOutput(
+        "Shooter/Flywheel/RawAccelerationRPMPerSecond", rawFlywheelAccelerationRpmPerSecond);
+    Logger.recordOutput(
+        "Shooter/Flywheel/FilteredAccelerationRPMPerSecond",
+        filteredFlywheelAccelerationRpmPerSecond);
+    Logger.recordOutput(
+        "Shooter/Flywheel/MotorTemperatureCelsius", flywheelMotor.getMotorTemperature());
+    Logger.recordOutput("Shooter/Flywheel/ActiveFaultBits", flywheelMotor.getFaults().rawBits);
+    Logger.recordOutput("Shooter/Flywheel/ActiveWarningBits", flywheelMotor.getWarnings().rawBits);
     Logger.recordOutput("Shooter/Flywheel/BusVoltage", flywheelMotor.getBusVoltage());
     Logger.recordOutput("Shooter/Feeder/TargetRPM", feederTargetRpm);
     Logger.recordOutput("Shooter/Feeder/MeasuredRPM", feederEncoder.getVelocity());
     Logger.recordOutput("Shooter/Feeder/CommandedVolts", feederCommandedVolts);
+    Logger.recordOutput("Shooter/Feeder/OutputCurrentAmps", feederMotor.getOutputCurrent());
+    Logger.recordOutput(
+        "Shooter/Feeder/MotorTemperatureCelsius", feederMotor.getMotorTemperature());
+    Logger.recordOutput("Shooter/Feeder/ActiveFaultBits", feederMotor.getFaults().rawBits);
+    Logger.recordOutput("Shooter/Feeder/ActiveWarningBits", feederMotor.getWarnings().rawBits);
     Logger.recordOutput("Shooter/Feeder/FeedingShot", feedingShot);
     Logger.recordOutput("Shooter/DistanceMeters", distanceMeters);
     Logger.recordOutput("Shooter/AtSpeed", atSpeed);
     Logger.recordOutput("Shooter/SequenceState", sequenceState);
     Logger.recordOutput("Shooter/CompletedFeedPulses", completedFeedPulses);
+    Logger.recordOutput("Shooter/EstimatedShotEvents", estimatedShotEvents);
+    Logger.recordOutput("Shooter/LastShotEventReason", lastShotEventReason);
+    Logger.recordOutput("Shooter/LastDetectedShotSeconds", lastDetectedShotSeconds);
+    Logger.recordOutput("Shooter/LastPulseMinimumRPM", lastPulseMinimumRpm);
+    Logger.recordOutput("Shooter/LastPulseMaximumDroopRPM", lastPulseMaximumDroopRpm);
+    Logger.recordOutput(
+        "Shooter/LastPulseMaximumFlywheelCurrentAmps", lastPulseMaximumFlywheelCurrentAmps);
+    Logger.recordOutput(
+        "Shooter/LastPulseMaximumFeederCurrentAmps", lastPulseMaximumFeederCurrentAmps);
+    Logger.recordOutput(
+        "Shooter/ShotDetection/FlywheelCurrentRiseAmps", shotDetectionFlywheelCurrentRiseAmps);
+    Logger.recordOutput(
+        "Shooter/ShotDetection/FeederCurrentRiseAmps", shotDetectionFeederCurrentRiseAmps);
+    Logger.recordOutput(
+        "Shooter/ShotDetection/ImpactDecelerationThresholdRPMPerSecond",
+        IMPACT_DECELERATION_RPM_PER_SECOND);
+    Logger.recordOutput(
+        "Shooter/ShotDetection/SupportingDecelerationThresholdRPMPerSecond",
+        SUPPORTING_DECELERATION_RPM_PER_SECOND);
+    Logger.recordOutput(
+        "Shooter/ShotDetection/FlywheelCurrentRiseThresholdAmps", FLYWHEEL_CURRENT_RISE_AMPS);
+    Logger.recordOutput(
+        "Shooter/ShotDetection/FeederCurrentRiseThresholdAmps", FEEDER_CURRENT_RISE_AMPS);
     Logger.recordOutput("Shooter/LastRecoverySeconds", lastRecoverySeconds);
+  }
+
+  private void updateFlywheelAcceleration(double nowSeconds, double measuredRpm) {
+    if (Double.isFinite(previousVelocitySampleSeconds)) {
+      double samplePeriodSeconds = nowSeconds - previousVelocitySampleSeconds;
+      if (samplePeriodSeconds > 0.001 && samplePeriodSeconds < 0.1) {
+        rawFlywheelAccelerationRpmPerSecond =
+            (measuredRpm - previousVelocitySampleRpm) / samplePeriodSeconds;
+        double filterWeight =
+            samplePeriodSeconds / (ACCELERATION_FILTER_TIME_CONSTANT_SECONDS + samplePeriodSeconds);
+        filteredFlywheelAccelerationRpmPerSecond +=
+            filterWeight
+                * (rawFlywheelAccelerationRpmPerSecond - filteredFlywheelAccelerationRpmPerSecond);
+      }
+    }
+    previousVelocitySampleRpm = measuredRpm;
+    previousVelocitySampleSeconds = nowSeconds;
   }
 }

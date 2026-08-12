@@ -2,7 +2,11 @@
 """Advanced 2026 FRC FUEL shooter model and calibration tool.
 
 This is an offline design/calibration model, not a replacement for on-robot
-closed-loop control.  It combines:
+closed-loop control. RPM ALWAYS means the measured flywheel/launcher-roller RPM.
+The robot PID is responsible for reaching that RPM; motor count, motor torque,
+current limits, and gearing are intentionally not part of this ballistic model.
+
+It combines:
 
 * 3-D time-domain projectile dynamics.
 * Reynolds-number-dependent quadratic drag.
@@ -18,7 +22,6 @@ closed-loop control.  It combines:
 * Adaptive Monte Carlo around competitive RPM/angle candidates.
 * Multiprocessing or threading with tqdm progress bars.
 * Dense continuous distance lookup generation.
-* Flywheel energy droop and current-limited recovery simulation for bursts.
 
 Fallback calibration
 --------------------
@@ -38,6 +41,8 @@ Only the columns you have are required.  The most useful are::
     lip_x_m,lip_y_m
     distance_error_m,lateral_error_m,exit_height_error_m
 
+Here ``rpm`` means measured flywheel/launcher-roller RPM, not motor-command percent.
+
 ``result`` values such as ``center``, ``centered``, ``bullseye`` and
 ``good-center`` are treated as centered/good shots.  ``recommended_rpm`` can
 also be supplied to build an empirical residual correction.
@@ -46,19 +51,15 @@ Examples
 --------
 Default fixed-angle model::
 
-    python shooter_model_2026_v3.py --workers 8
+    python shooter_model_2026_everybot_pid.py --workers 8
 
 Adjustable hood::
 
-    python shooter_model_2026_v3.py --optimize-angle --workers 8
+    python shooter_model_2026_everybot_pid.py --optimize-angle --workers 8
 
 Measured calibration and automatic fitting::
 
-    python shooter_model_2026_v3.py --calibration-csv shots.csv --auto-calibrate --workers 8
-
-Burst/recovery simulation (after updating real wheel/motor constants)::
-
-    python shooter_model_2026_v3.py --burst-count 6 --feed-interval 0.25
+    python shooter_model_2026_everybot_pid.py --calibration-csv shots.csv --auto-calibrate --workers 8
 """
 
 from __future__ import annotations
@@ -121,66 +122,43 @@ HUB_LIP_HEIGHT_M = 72.0 * 0.0254
 
 
 # ===========================================================================
-# REAL ROBOT CONSTANTS -- UPDATE THESE ON THE FINISHED ROBOT
+# YOUR 2026 EVERYBOT SHOOTER CONSTANTS
 # ===========================================================================
+# RPM semantics:
+#   Every RPM value in this file is the ACTUAL MEASURED FLYWHEEL / LAUNCHER-ROLLER
+#   RPM. Your robot-side velocity PID handles however many motors are attached and
+#   keeps the roller at the requested setpoint. Motor count and electrical details
+#   therefore do not belong in this projectile model.
+#
 # Coordinate convention:
 #   +x = robot forward / toward HUB when aimed
 #   +y = robot left
 #   +z = up
-# Robot-center distances in the lookup are measured from the robot pose origin
-# (normally the drivetrain/odometry center), NOT from the shooter exit.
+#
+# These geometry values are the assumptions requested for your robot.
 
-# Measure from carpet to the CENTER of FUEL at the instant it loses shooter contact.
+# Carpet -> CENTER of FUEL at the instant it leaves the shooter.
 ROBOT_SHOOTER_EXIT_HEIGHT_M = 0.600
 
-# Measure from your robot pose/rotation center to that same exit point.
+# Robot pose/rotation center -> FUEL release point.
 ROBOT_SHOOTER_FORWARD_OFFSET_M = 0.000
 ROBOT_SHOOTER_LEFT_OFFSET_M = 0.000
 
-# Measure the actual initial velocity angle from horizontal.  Slow-motion video is
-# better than assuming this equals the mechanical hood surface angle.
+# Actual initial FUEL velocity angle above horizontal.
 ROBOT_NOMINAL_LAUNCH_ANGLE_DEG = 70.0
 
-# Shooter wheel geometry.  Enter actual OUTSIDE diameters.
-SHOOTER_TOP_WHEEL_DIAMETER_M = 0.1016       # 4.0 in placeholder
-SHOOTER_BOTTOM_WHEEL_DIAMETER_M = 0.1016    # 4.0 in placeholder
+# Stock Everybot launcher wheel diameter. This is useful metadata and for relating
+# measured flywheel RPM to surface speed, but measured RPM -> ball-speed calibration
+# remains authoritative.
+FLYWHEEL_DIAMETER_M = 4.0 * 0.0254  # 0.1016 m
+FLYWHEEL_COUNT = 6                   # metadata only; not used in trajectory physics
 
-# wheel RPM / motor RPM.  Direct drive = 1.0.  A 2:1 motor reduction = 0.5.
-SHOOTER_TOP_MOTOR_TO_WHEEL_RATIO = 1.0
-SHOOTER_BOTTOM_MOTOR_TO_WHEEL_RATIO = 1.0
+# Fallback ball-spin prior used only when no measured ``rpm,spin_rpm`` calibration
+# is supplied. This is BALL spin RPM per measured FLYWHEEL RPM.
+SHOOTER_FALLBACK_BACKSPIN_RPM_PER_FLYWHEEL_RPM = 0.50
 
-# Relative commanded wheel speeds if the two sides intentionally run differently.
-SHOOTER_TOP_COMMAND_RATIO = 1.0
-SHOOTER_BOTTOM_COMMAND_RATIO = 1.0
-
-# Rotating mass used ONLY by burst/recovery simulation.  Measure or estimate all
-# shooter wheels on each side; the model approximates each as a solid disk.
-SHOOTER_TOP_WHEEL_MASS_KG = 0.180
-SHOOTER_BOTTOM_WHEEL_MASS_KG = 0.180
-SHOOTER_TOP_WHEEL_COUNT = 1
-SHOOTER_BOTTOM_WHEEL_COUNT = 1
-
-# Shafts, hubs, gears, extra flywheel disks etc. expressed as additional inertia
-# referred to the shooter wheel shaft.  Set from CAD if possible.
-SHOOTER_EXTRA_ROTATING_INERTIA_KG_M2 = 0.00020
-
-# Motor model for flywheel recovery. UPDATE to the exact motor(s) and gearing.
-MOTOR_COUNT_TOP = 1
-MOTOR_COUNT_BOTTOM = 1
-MOTOR_FREE_SPEED_RPM = 5676.0               # NEO-like placeholder
-MOTOR_STALL_TORQUE_NM = 2.60                # placeholder
-MOTOR_STALL_CURRENT_A = 105.0               # placeholder
-MOTOR_CURRENT_LIMIT_A = 60.0                # UPDATE to robot configuration
-MOTOR_MECHANICAL_EFFICIENCY = 0.88
-
-# Shooter transfer priors.  These are replaced/overridden by real exit-speed and
-# spin calibration whenever those measurements are supplied.
-SHOOTER_SPEED_TRANSFER_EFFICIENCY = 0.72
-SHOOTER_SPIN_TRANSFER_EFFICIENCY = 0.55
-SHOOTER_FALLBACK_BACKSPIN_RPM_PER_COMMAND_RPM = 0.50
-
-# HUB collision geometry.  Verify these against your field/practice HUB/CAD if you
-# want rim/funnel contact predictions to be quantitative.
+# HUB collision geometry. Verify these against official CAD / your practice HUB if
+# you need quantitative rim/funnel-contact predictions.
 HUB_RIM_RADIAL_WIDTH_M = 0.040
 HUB_RIM_THICKNESS_M = 0.012
 HUB_FUNNEL_DEPTH_M = 0.330
@@ -602,33 +580,6 @@ class OptimizedShot:
     probability_band_high_rpm: float
     nominal: TrajectoryResult
 
-
-@dataclass(frozen=True)
-class FlywheelModel:
-    top_wheel_diameter_m: float = SHOOTER_TOP_WHEEL_DIAMETER_M
-    bottom_wheel_diameter_m: float = SHOOTER_BOTTOM_WHEEL_DIAMETER_M
-    top_wheel_mass_kg: float = SHOOTER_TOP_WHEEL_MASS_KG
-    bottom_wheel_mass_kg: float = SHOOTER_BOTTOM_WHEEL_MASS_KG
-    top_wheel_count: int = SHOOTER_TOP_WHEEL_COUNT
-    bottom_wheel_count: int = SHOOTER_BOTTOM_WHEEL_COUNT
-    extra_inertia_kg_m2: float = SHOOTER_EXTRA_ROTATING_INERTIA_KG_M2
-    motor_count_top: int = MOTOR_COUNT_TOP
-    motor_count_bottom: int = MOTOR_COUNT_BOTTOM
-    motor_to_wheel_ratio_top: float = SHOOTER_TOP_MOTOR_TO_WHEEL_RATIO
-    motor_to_wheel_ratio_bottom: float = SHOOTER_BOTTOM_MOTOR_TO_WHEEL_RATIO
-    motor_free_speed_rpm: float = MOTOR_FREE_SPEED_RPM
-    motor_stall_torque_nm: float = MOTOR_STALL_TORQUE_NM
-    motor_stall_current_a: float = MOTOR_STALL_CURRENT_A
-    current_limit_a: float = MOTOR_CURRENT_LIMIT_A
-    mechanical_efficiency: float = MOTOR_MECHANICAL_EFFICIENCY
-
-    @property
-    def inertia_kg_m2(self) -> float:
-        top_r = 0.5 * self.top_wheel_diameter_m
-        bottom_r = 0.5 * self.bottom_wheel_diameter_m
-        top = self.top_wheel_count * 0.5 * self.top_wheel_mass_kg * top_r**2
-        bottom = self.bottom_wheel_count * 0.5 * self.bottom_wheel_mass_kg * bottom_r**2
-        return top + bottom + self.extra_inertia_kg_m2
 
 
 # ===========================================================================
@@ -1198,7 +1149,7 @@ def fallback_calibration(
             speed_curve=None,
             spin_curve=None,
             fallback_speed_per_rpm=speed_mps / CALIBRATION_RPM,
-            fallback_spin_per_rpm=SHOOTER_FALLBACK_BACKSPIN_RPM_PER_COMMAND_RPM,
+            fallback_spin_per_rpm=SHOOTER_FALLBACK_BACKSPIN_RPM_PER_FLYWHEEL_RPM,
             source="temporary fallback root",
         )
         reached, position, *_ = simulate_to_lip(
@@ -1238,7 +1189,7 @@ def fallback_calibration(
         speed_curve=None,
         spin_curve=None,
         fallback_speed_per_rpm=root / CALIBRATION_RPM,
-        fallback_spin_per_rpm=SHOOTER_FALLBACK_BACKSPIN_RPM_PER_COMMAND_RPM,
+        fallback_spin_per_rpm=SHOOTER_FALLBACK_BACKSPIN_RPM_PER_FLYWHEEL_RPM,
         source="fallback linear speed model anchored to 2.00 m = 1400 RPM",
     )
 
@@ -2975,7 +2926,7 @@ def write_calibration_report(
     path = output_directory / "calibration_report.txt"
     with path.open("w", encoding="utf-8") as output_file:
         output_file.write(f"Calibration source: {calibration.source}\n")
-        output_file.write(f"Fallback 1400 RPM speed: {float(calibration.speed_from_rpm(1400.0)):.6f} m/s\n")
+        output_file.write(f"1400 flywheel RPM speed: {float(calibration.speed_from_rpm(1400.0)):.6f} m/s\n")
         output_file.write(f"Spin source: {calibration.spin_curve.source if calibration.spin_curve else 'fallback spin ratio'}\n")
         output_file.write(f"Cd reference: {aero.cd_reference:.6f}\n")
         output_file.write(f"Cd log-Re slope: {aero.cd_log_re_slope:.6f}\n")
@@ -3001,132 +2952,6 @@ def print_java_entries(shots: Sequence[OptimizedShot]) -> None:
     for shot in shots:
         print(f"HOOD_ANGLE_DEG_BY_DISTANCE.put({shot.distance_m:.2f}, {shot.angle_deg:.3f});")
 
-
-# ===========================================================================
-# FLYWHEEL DROOP / RECOVERY MODEL
-# ===========================================================================
-
-
-def _motor_available_torque_at_wheel(
-    wheel_rpm: float,
-    model: FlywheelModel,
-) -> float:
-    # Approximate combined top+bottom torque referred to wheel shaft.  Current limit
-    # caps the low-speed torque; linear torque-speed relation caps high-speed torque.
-    total = 0.0
-    for motor_count, ratio in (
-        (model.motor_count_top, model.motor_to_wheel_ratio_top),
-        (model.motor_count_bottom, model.motor_to_wheel_ratio_bottom),
-    ):
-        if motor_count <= 0 or ratio <= 0.0:
-            continue
-        motor_rpm = wheel_rpm / ratio
-        speed_fraction = float(np.clip(motor_rpm / model.motor_free_speed_rpm, 0.0, 1.2))
-        speed_limited_torque = max(0.0, model.motor_stall_torque_nm * (1.0 - speed_fraction))
-        current_limited_torque = model.motor_stall_torque_nm * min(1.0, model.current_limit_a / model.motor_stall_current_a)
-        motor_torque = min(speed_limited_torque, current_limited_torque)
-        # Torque multiplication motor -> wheel is inverse of wheelRPM/motorRPM.
-        wheel_torque_per_motor = motor_torque / ratio
-        total += motor_count * wheel_torque_per_motor
-    return total * model.mechanical_efficiency
-
-
-def simulate_flywheel_burst(
-    commanded_rpm: float,
-    launch_speed_mps: float,
-    spin_rpm: float,
-    ball: BallModel,
-    model: FlywheelModel,
-    burst_count: int,
-    feed_interval_s: float,
-    dt_s: float = 0.001,
-    post_recovery_s: float = 1.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    inertia = model.inertia_kg_m2
-    if inertia <= 1e-7:
-        raise ValueError("Flywheel inertia is unrealistically small; update real shooter constants")
-
-    command_omega = commanded_rpm * 2.0 * math.pi / 60.0
-    omega = command_omega
-    ball_spin = spin_rpm * 2.0 * math.pi / 60.0
-    ball_inertia = 0.4 * ball.mass_kg * ball.radius_m**2
-    shot_energy = 0.5 * ball.mass_kg * launch_speed_mps**2 + 0.5 * ball_inertia * ball_spin**2
-    # Mechanical transfer loss means more flywheel energy is removed than ball gains.
-    shot_energy_from_flywheel = shot_energy / max(SHOOTER_SPEED_TRANSFER_EFFICIENCY, 0.20)
-
-    shot_times = np.arange(burst_count, dtype=float) * feed_interval_s
-    total_time = (shot_times[-1] if burst_count > 0 else 0.0) + post_recovery_s
-    steps = int(math.ceil(total_time / dt_s)) + 1
-    time = np.arange(steps) * dt_s
-    rpm_trace = np.empty(steps, dtype=float)
-    current_trace = np.empty(steps, dtype=float)
-    next_shot = 0
-
-    for i, t in enumerate(time):
-        while next_shot < burst_count and t + 0.5 * dt_s >= shot_times[next_shot]:
-            energy_before = 0.5 * inertia * omega**2
-            energy_after = max(0.0, energy_before - shot_energy_from_flywheel)
-            omega = math.sqrt(2.0 * energy_after / inertia)
-            next_shot += 1
-
-        rpm = omega * 60.0 / (2.0 * math.pi)
-        torque = _motor_available_torque_at_wheel(rpm, model)
-        if omega < command_omega:
-            alpha = torque / inertia
-            omega = min(command_omega, omega + alpha * dt_s)
-        else:
-            torque = 0.0
-        # Approximate current from torque fraction at stall torque summed across motors.
-        total_motors = max(model.motor_count_top + model.motor_count_bottom, 1)
-        equivalent_motor_torque = torque / max(total_motors, 1)
-        current = min(
-            total_motors * model.current_limit_a,
-            total_motors * model.motor_stall_current_a * equivalent_motor_torque / max(model.motor_stall_torque_nm, 1e-9),
-        )
-        rpm_trace[i] = rpm
-        current_trace[i] = max(0.0, current)
-    return time, rpm_trace, current_trace
-
-
-def write_flywheel_recovery_outputs(
-    output_directory: Path,
-    commanded_rpm: float,
-    launch_speed_mps: float,
-    spin_rpm: float,
-    ball: BallModel,
-    burst_count: int,
-    feed_interval_s: float,
-) -> tuple[Path, Path]:
-    model = FlywheelModel()
-    time, rpm, current = simulate_flywheel_burst(
-        commanded_rpm,
-        launch_speed_mps,
-        spin_rpm,
-        ball,
-        model,
-        burst_count,
-        feed_interval_s,
-    )
-    csv_path = output_directory / "flywheel_recovery.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as output_file:
-        writer = csv.writer(output_file)
-        writer.writerow(["time_s", "flywheel_rpm", "estimated_total_motor_current_a"])
-        for values in zip(time, rpm, current, strict=True):
-            writer.writerow([f"{values[0]:.5f}", f"{values[1]:.3f}", f"{values[2]:.3f}"])
-
-    figure, axis = plt.subplots(figsize=(9.5, 5.5), layout="constrained")
-    axis.plot(time, rpm, label="Flywheel RPM")
-    axis.axhline(commanded_rpm, linestyle="--", linewidth=1.0, label="Commanded RPM")
-    axis.set(title="Flywheel Burst Droop and Recovery", xlabel="Time (s)", ylabel="Flywheel RPM")
-    axis.grid(alpha=0.3)
-    axis.legend(loc="upper left")
-    twin = axis.twinx()
-    twin.plot(time, current, alpha=0.45, label="Estimated current")
-    twin.set_ylabel("Estimated total motor current (A)")
-    png_path = output_directory / "flywheel_recovery.png"
-    figure.savefig(png_path, dpi=180)
-    plt.close(figure)
-    return csv_path, png_path
 
 
 # ===========================================================================
@@ -3190,9 +3015,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wind-y", type=float, default=0.0)
     parser.add_argument("--wind-z", type=float, default=0.0)
 
-    parser.add_argument("--burst-count", type=int, default=0, help="Generate flywheel droop/recovery model for N shots")
-    parser.add_argument("--feed-interval", type=float, default=0.25)
-    parser.add_argument("--burst-distance", type=float, default=2.0, help="Use optimized shot nearest this distance for burst model")
     return parser
 
 
@@ -3211,8 +3033,6 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("use either --optimize-angle or --fixed-angle")
     if args.dense_step <= 0.0 or args.heatmap_rpm_step <= 0.0:
         parser.error("lookup/heatmap steps must be positive")
-    if args.burst_count < 0 or args.feed_interval <= 0.0:
-        parser.error("invalid burst configuration")
 
 
 def main() -> None:
@@ -3363,21 +3183,12 @@ def main() -> None:
         not bool(args.no_progress),
     )
 
-    if args.burst_count > 0:
-        nearest = min(shots, key=lambda shot: abs(shot.distance_m - float(args.burst_distance)))
-        nominal_spin = float(np.linalg.norm(nearest.nominal.initial_spin_rpm_xyz))
-        write_flywheel_recovery_outputs(
-            output_directory,
-            nearest.rpm,
-            nearest.nominal.launch_speed_mps,
-            nominal_spin,
-            ball,
-            int(args.burst_count),
-            float(args.feed_interval),
-        )
 
     print_java_entries(shots)
     print("\nModel summary:")
+    print("  RPM definition: measured flywheel / launcher-roller RPM")
+    print(f"  Shooter geometry: z={shooter.exit_height_m:.3f} m, x-offset={shooter.forward_offset_m:.3f} m, y-offset={shooter.left_offset_m:.3f} m")
+    print(f"  Nominal launch angle: {ROBOT_NOMINAL_LAUNCH_ANGLE_DEG:.1f} deg")
     print(f"  Calibration: {calibration.source}")
     print(f"  1400 RPM -> {float(calibration.speed_from_rpm(CALIBRATION_RPM)):.3f} m/s")
     print(f"  Cd(reference): {aero.cd_reference:.4f}")
