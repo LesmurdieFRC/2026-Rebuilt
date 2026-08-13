@@ -1,12 +1,15 @@
 Calibration source: fallback linear speed model anchored to 2.00 m = 1400 RPM
-1400 flywheel RPM speed: 6.499001 m/s
+1400 flywheel RPM speed: 6.499388 m/s
 Spin source: fallback spin ratio
+Speed scatter source: fallback constant
+Spin scatter source: fallback constant
 Cd reference: 0.470000
 Cd log-Re slope: 0.025000
 Magnus slope: 0.100000
 Spin decay tau: 2.500000 s
 Launch-angle bias: +0.000000 deg
 Shot covariance learned rows: 0
+Empirical score/contact model rows: 0
 Empirical correction points: 0
 
 Shot-error covariance order:

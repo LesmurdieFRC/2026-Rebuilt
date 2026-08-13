@@ -16,7 +16,6 @@ import org.curtinfrc.frc2026.shooter.Shooter;
 /** Configures Choreo trajectory following and dashboard autonomous selection. */
 public final class Autos {
   private static final String TRAJECTORY_EXTENSION = ".traj";
-  private static final double AUTO_INTAKE_SECONDS = 2.0;
 
   private final AutoChooser chooser = new AutoChooser("Do Nothing");
   private final Alert noTrajectoriesAlert =
@@ -48,17 +47,21 @@ public final class Autos {
 
   /**
    * Global Choreo event-marker names. Add one of these markers to any trajectory to run the
-   * corresponding command. Use shoot or score for one feeder pulse, or shoot2/shoot3 for a
-   * sensorless two- or three-pulse burst. Every shot waits for flywheel recovery.
+   * corresponding command. "Start Intake" runs until "Stop Intake", and "Shoot" meters three
+   * sensorless shots while waiting for flywheel recovery between each one.
    */
   private static void configureEventBindings(AutoFactory factory, Drive drive, Shooter shooter) {
     factory
-        .bind("intake", shooter.intake().withTimeout(AUTO_INTAKE_SECONDS))
-        .bind("shoot", shooter.shootBurst(drive::getDistanceToAllianceHub, 1))
+        .bind("Start Intake", shooter.intake())
+        .bind("Stop Intake", shooter.stopOnce())
+        .bind("Shoot", shooter.shootBurst(drive::getDistanceToAllianceHub, 3))
+        // Keep the existing lowercase marker names usable in previously-authored paths.
+        .bind("intake", shooter.intake())
+        .bind("stop", shooter.stopOnce())
+        .bind("shoot", shooter.shootBurst(drive::getDistanceToAllianceHub, 3))
         .bind("score", shooter.shootBurst(drive::getDistanceToAllianceHub, 1))
         .bind("shoot2", shooter.shootBurst(drive::getDistanceToAllianceHub, 2))
-        .bind("shoot3", shooter.shootBurst(drive::getDistanceToAllianceHub, 3))
-        .bind("stop", shooter.stop());
+        .bind("shoot3", shooter.shootBurst(drive::getDistanceToAllianceHub, 3));
   }
 
   private static List<String> findDeployedTrajectories() {

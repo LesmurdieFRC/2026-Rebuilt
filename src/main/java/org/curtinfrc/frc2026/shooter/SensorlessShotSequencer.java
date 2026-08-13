@@ -5,6 +5,7 @@ final class SensorlessShotSequencer {
   record Config(
       double readyToleranceRpm,
       double readyStableSeconds,
+      double readyMaximumAccelerationRpmPerSecond,
       double recoveryDropRpm,
       double eventArmingSeconds,
       double maximumFeedSeconds,
@@ -102,7 +103,10 @@ final class SensorlessShotSequencer {
 
     boolean atSpeed =
         Math.abs(sample.targetRpm() - sample.measuredRpm()) <= config.readyToleranceRpm();
-    if (!atSpeed) {
+    boolean speedSettled =
+        Math.abs(sample.filteredAccelerationRpmPerSecond())
+            <= config.readyMaximumAccelerationRpmPerSecond();
+    if (!atSpeed || !speedSettled) {
       readySinceSeconds = Double.NaN;
       return false;
     }

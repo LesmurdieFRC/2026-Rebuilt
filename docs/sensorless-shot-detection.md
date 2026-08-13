@@ -11,9 +11,11 @@ one of the following after the feeder has run for 40 ms:
   that feeder pulse.
 
 A current spike by itself is not counted because it could be a feeder jam. On a
-detected event, the feeder immediately returns to its staging speed. The next
-pulse cannot start until the flywheel has recovered and remained within 50 RPM
-of target for 100 ms. Empty pulses time out after 200 ms.
+detected event, the feeder immediately stops. The next
+pulse cannot start until the flywheel has recovered, remained within 50 RPM of
+target, and stayed below 600 RPM/s acceleration for 100 ms. While feeding, a
+0.75 V anticipatory boost helps replace the energy the game piece is about to
+remove from the flywheel. Empty pulses time out after 200 ms.
 
 ## AdvantageScope tuning
 

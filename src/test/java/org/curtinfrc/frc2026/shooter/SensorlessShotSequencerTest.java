@@ -8,7 +8,7 @@ import org.junit.jupiter.api.Test;
 
 class SensorlessShotSequencerTest {
   private static final SensorlessShotSequencer.Config CONFIG =
-      new SensorlessShotSequencer.Config(50, 0.10, 100, 0.04, 0.20, 0.12, -2500, -800, 8, 6);
+      new SensorlessShotSequencer.Config(50, 0.10, 600, 100, 0.04, 0.20, 0.12, -2500, -800, 8, 6);
 
   @Test
   void waitsForStableSpeedBeforeFeeding() {
@@ -18,6 +18,17 @@ class SensorlessShotSequencerTest {
     assertFalse(sequencer.update(0.02, sample(1400, 1400, 0, 5, 2)));
     assertFalse(sequencer.update(0.10, sample(1400, 1400, 0, 5, 2)));
     assertTrue(sequencer.update(0.13, sample(1400, 1400, 0, 5, 2)));
+  }
+
+  @Test
+  void waitsForAccelerationToSettleBeforeFeeding() {
+    SensorlessShotSequencer sequencer = new SensorlessShotSequencer(CONFIG, 0);
+
+    assertFalse(sequencer.update(0.00, sample(1400, 1400, 900, 5, 2)));
+    assertFalse(sequencer.update(0.10, sample(1400, 1400, 700, 5, 2)));
+    assertFalse(sequencer.update(0.12, sample(1400, 1400, 100, 5, 2)));
+    assertFalse(sequencer.update(0.20, sample(1400, 1400, 100, 5, 2)));
+    assertTrue(sequencer.update(0.23, sample(1400, 1400, 100, 5, 2)));
   }
 
   @Test

@@ -14,7 +14,6 @@ import edu.wpi.first.wpilibj2.command.CommandScheduler;
 import edu.wpi.first.wpilibj2.command.Subsystem;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
 import edu.wpi.first.wpilibj2.command.button.RobotModeTriggers;
-import edu.wpi.first.wpilibj2.command.sysid.SysIdRoutine;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -30,6 +29,7 @@ import org.curtinfrc.frc2026.drive.ModuleIOTalonFX;
 import org.curtinfrc.frc2026.drive.TunerConstants;
 import org.curtinfrc.frc2026.shooter.Shooter;
 import org.curtinfrc.frc2026.util.PhoenixUtil;
+import org.curtinfrc.frc2026.util.TestModeWPILOGWriter;
 import org.curtinfrc.frc2026.util.VirtualSubsystem;
 import org.curtinfrc.frc2026.vision.Vision;
 import org.curtinfrc.frc2026.vision.VisionIO;
@@ -49,6 +49,8 @@ import org.littletonrobotics.junction.wpilog.WPILOGWriter;
  * project.
  */
 public class Robot extends LoggedRobot {
+  private static final String INTERNAL_TEST_LOG_DIRECTORY = "/home/lvuser/logs";
+
   private Drive drive;
   private Vision vision;
   private final Shooter shooter = new Shooter();
@@ -72,7 +74,7 @@ public class Robot extends LoggedRobot {
 
     switch (Constants.getMode()) {
       case REAL -> {
-        Logger.addDataReceiver(new WPILOGWriter());
+        Logger.addDataReceiver(new TestModeWPILOGWriter(INTERNAL_TEST_LOG_DIRECTORY));
         Logger.addDataReceiver(new NT4Publisher());
       }
       case SIM -> {
@@ -169,14 +171,17 @@ public class Robot extends LoggedRobot {
 
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
     shooter.setDefaultCommand(shooter.stop());
-    controller.leftTrigger().whileTrue(shooter.intake());
-    controller.rightTrigger().whileTrue(shooter.shoot(drive::getDistanceToAllianceHub));
+    var teleopMode = RobotModeTriggers.teleop();
+    teleopMode.and(controller.leftTrigger()).whileTrue(shooter.intake());
+    teleopMode
+        .and(controller.rightTrigger())
+        .whileTrue(shooter.shoot(drive::getDistanceToAllianceHub));
     drive.setDefaultCommand(
         drive.joystickDrive(
-            () -> -controller.getLeftY(),
-            () -> -controller.getLeftX(),
-            () -> -controller.getRightX()));
-    controller.y().whileTrue(drive.hubCommand());
+            () -> DriverStation.isTeleopEnabled() ? -controller.getLeftY() : 0.0,
+            () -> DriverStation.isTeleopEnabled() ? -controller.getLeftX() : 0.0,
+            () -> DriverStation.isTeleopEnabled() ? -controller.getRightX() : 0.0));
+    teleopMode.and(controller.y()).whileTrue(drive.hubCommand());
     configureShooterSysIdBindings();
     // controller.y().onTrue(Commands.run(() -> drive.setPose(new Pose2d(0,0, Rotation2d.kZero))));
     autos = new Autos(drive, shooter);
@@ -190,18 +195,11 @@ public class Robot extends LoggedRobot {
 
   private void configureShooterSysIdBindings() {
     var testMode = RobotModeTriggers.test();
-    testMode
-        .and(controller.povUp())
-        .whileTrue(shooter.flywheelSysIdQuasistatic(SysIdRoutine.Direction.kForward));
-    testMode
-        .and(controller.povDown())
-        .whileTrue(shooter.flywheelSysIdQuasistatic(SysIdRoutine.Direction.kReverse));
-    testMode
-        .and(controller.povRight())
-        .whileTrue(shooter.flywheelSysIdDynamic(SysIdRoutine.Direction.kForward));
-    testMode
-        .and(controller.povLeft())
-        .whileTrue(shooter.flywheelSysIdDynamic(SysIdRoutine.Direction.kReverse));
+    testMode.and(controller.a()).toggleOnTrue(shooter.completeFlywheelSysId());
+    testMode.and(controller.povDown()).whileTrue(shooter.testShootAtRpm(1000.0));
+    testMode.and(controller.povLeft()).whileTrue(shooter.testShootAtRpm(1500.0));
+    testMode.and(controller.povRight()).whileTrue(shooter.testShootAtRpm(2000.0));
+    testMode.and(controller.povUp()).whileTrue(shooter.testShootAtRpm(2500.0));
   }
 
   /** This function is called periodically during all modes. */
@@ -238,7 +236,10 @@ public class Robot extends LoggedRobot {
 
   /** This function is called once when teleop is enabled. */
   @Override
-  public void teleopInit() {}
+  public void teleopInit() {
+    // Interrupt any long-running autonomous mechanism event, such as Start Intake.
+    CommandScheduler.getInstance().schedule(shooter.stopOnce());
+  }
 
   /** This function is called periodically during operator control. */
   @Override

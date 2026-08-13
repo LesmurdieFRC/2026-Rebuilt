@@ -12,27 +12,27 @@ through AdvantageKit.
 3. Check that the flywheel can safely rotate in both directions. Do not run the
    reverse tests if the mechanism can be damaged by reversing.
 4. Deploy the code, connect a controller on port 0, and enable **Test** mode.
-5. Hold a binding only while the test should run. Releasing it immediately
-   commands zero volts. Every command also has a six-second safety timeout.
+5. Press **A** once to start the complete sequence. Press **A** again at any
+   time to cancel it and command zero volts. Every individual test also has a
+   six-second safety timeout.
 
 ## Test-mode bindings
 
-| Controller input | Test |
+| Controller input | Action |
 | --- | --- |
-| D-pad up | Quasistatic forward, 1 V/s ramp |
-| D-pad down | Quasistatic reverse, 1 V/s ramp |
-| D-pad right | Dynamic forward, 6 V step |
-| D-pad left | Dynamic reverse, 6 V step |
+| A | Start the complete four-test sequence; press again to cancel |
 
-Run all four tests in that order. Let the flywheel stop fully between tests.
-The quasistatic tests may run to the six-second timeout. For dynamic tests,
-roughly two seconds is normally enough; release the D-pad once the flywheel is
-near steady speed.
+The command automatically runs quasistatic forward, quasistatic reverse,
+dynamic forward, and dynamic reverse. It commands zero volts after every test,
+waits until the flywheel is below 50 RPM, and allows another 250 ms to settle
+before continuing. The whole sequence takes roughly 30 seconds.
 
 ## Getting the data into SysId
 
-Real-robot WPILOG recording is enabled. Download the AdvantageKit log from the
-robot, then:
+The robot records a WPILOG to internal storage only while Test mode is enabled.
+Disable the robot after the sequence finishes so the file is closed, then set
+AdvantageScope's robot log folder to `/home/lvuser/logs` and use **File >
+Download Logs...**. After downloading the newest AdvantageKit log:
 
 1. Open the log in AdvantageScope.
 2. Choose **File > Export Data**.

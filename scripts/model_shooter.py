@@ -1,65 +1,66 @@
 #!/usr/bin/env python3
-"""Advanced 2026 FRC FUEL shooter model and calibration tool.
+"""Advanced 2026 FRC FUEL shooter model, calibration, validation, and 3-D viewer.
 
 This is an offline design/calibration model, not a replacement for on-robot
 closed-loop control. RPM ALWAYS means the measured flywheel/launcher-roller RPM.
 The robot PID is responsible for reaching that RPM; motor count, motor torque,
 current limits, and gearing are intentionally not part of this ballistic model.
 
-It combines:
-
-* 3-D time-domain projectile dynamics.
-* Reynolds-number-dependent quadratic drag.
-* Full 3-D ball spin, Magnus lift, and spin decay.
-* Robot-center -> shooter-exit geometry and shooting-while-moving compensation.
-* Refined yaw lead solved against the simulated trajectory.
-* Regular-hex HUB opening plus rim and tapered-funnel contact simulation.
-* Monotonic PCHIP RPM -> exit-speed and RPM -> spin calibration.
-* Automatic fitting of selected physics parameters from real shot logs.
-* Learned shot-to-shot covariance from repeated measurements.
-* Sobol quasi-Monte-Carlo uncertainty sweeps.
-* Numba-JIT batch trajectory/contact simulation.
-* Adaptive Monte Carlo around competitive RPM/angle candidates.
-* Multiprocessing or threading with tqdm progress bars.
-* Dense continuous distance lookup generation.
+Major features
+--------------
+* 3-D time-domain projectile dynamics with Reynolds-dependent drag and Magnus lift.
+* Full 3-D spin with decay, spin-axis error, and spin-aware rigid contact impulses.
+* Official 2026 FUEL diameter/mass envelope and official 41.7in / 72in HUB opening.
+* Robot-center -> shooter-exit geometry and per-sample moving-shot lead compensation.
+* Accurate adaptive ``solve_ivp`` nominal trajectories plus RK4/JIT Monte Carlo.
+* RPM-conditioned measured exit-speed/spin calibration and scatter estimation.
+* Robust regularized aerodynamic fitting that never converts missing lip data to zero.
+* Pairwise/shrunk shot covariance that avoids RPM/exit-speed double counting.
+* Sobol quasi-Monte-Carlo uncertainty including FUEL size/mass and spin variation.
+* Genuine 2-D RPM/angle robust optimization, followed by high-sample local refinement.
+* Dense lookup re-simulation at the actual rounded RPM command (probability is not interpolated).
+* Separate held-out validation CSV with trajectory MAE, Brier score, and log loss.
+* Interactive 3-D replay, including the post-lip rim/funnel path and contacts.
+* Multiprocessing/threading, Numba JIT, tqdm progress, plots, heatmaps, and Java entries.
 
 Fallback calibration
 --------------------
-If no measured ``rpm,exit_speed_mps`` calibration is supplied, the physical
-speed scale is anchored so that the trusted 2.00 m / 1400 RPM / 70 degree shot
-crosses the HUB center while descending.  When the default fixed 70 degree
-configuration is used, the final lookup is also pinned to exactly 1400 RPM at
-2.00 m.
+If no measured ``rpm,exit_speed_mps`` calibration is supplied, the speed scale is
+anchored so the trusted 2.00 m / 1400 RPM / 70 degree shot crosses the HUB center
+while descending. The default fixed-70-degree lookup remains pinned to exactly
+1400 RPM at 2.00 m until measured speed calibration replaces that fallback.
 
-Recommended calibration CSV columns
------------------------------------
-Only the columns you have are required.  The most useful are::
+Recommended training-log columns
+--------------------------------
+Only columns you can actually measure are required. Useful columns include::
 
-    distance_m,rpm,exit_speed_mps,spin_rpm,result
-    actual_rpm,actual_angle_deg,yaw_error_deg
-    entry_angle_deg,flight_time_s
-    lip_x_m,lip_y_m
-    distance_error_m,lateral_error_m,exit_height_error_m
+    timestamp,session_id,ball_id,distance_m,rpm,actual_rpm
+    angle_deg,actual_angle_deg,exit_speed_mps,spin_rpm
+    result,scored,recommended_rpm,entry_angle_deg,flight_time_s
+    lip_x_m,lip_y_m,distance_error_m,lateral_error_m,exit_height_error_m
+    robot_vx_error_mps,robot_vy_error_mps,robot_omega_error_deg_s
+    rpm_before_shot,rpm_min_during_shot,rpm_after_shot,time_since_previous_shot_s
 
-Here ``rpm`` means measured flywheel/launcher-roller RPM, not motor-command percent.
-
-``result`` values such as ``center``, ``centered``, ``bullseye`` and
-``good-center`` are treated as centered/good shots.  ``recommended_rpm`` can
-also be supplied to build an empirical residual correction.
+``rpm`` is the requested/measured launcher-roller setpoint, not motor percent.
+Use a completely separate ``--validation-csv`` when you want honest held-out metrics.
 
 Examples
 --------
-Default fixed-angle model::
+Fixed 70 degree model::
 
-    python shooter_model_2026_everybot_pid.py --workers 8
+    python shooter_model_2026_everybot_pid_v2.py --workers 8
 
-Adjustable hood::
+Watch each completed distance shot in 3-D while workers continue calculating::
 
-    python shooter_model_2026_everybot_pid.py --optimize-angle --workers 8
+    python shooter_model_2026_everybot_pid_v2.py --workers 8 --live-3d
 
-Measured calibration and automatic fitting::
+Measured calibration + robust physics fit + held-out validation::
 
-    python shooter_model_2026_everybot_pid.py --calibration-csv shots.csv --auto-calibrate --workers 8
+    python shooter_model_2026_everybot_pid_v2.py --calibration-csv train.csv --validation-csv validation.csv --auto-calibrate --workers 8
+
+Adjustable hood with true 2-D RPM/angle optimization::
+
+    python shooter_model_2026_everybot_pid_v2.py --optimize-angle --angle-step 2.5 --workers 8 --show-3d
 """
 
 from __future__ import annotations
@@ -73,7 +74,7 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -113,8 +114,10 @@ AIR_DENSITY_KG_M3 = 1.225
 AIR_DYNAMIC_VISCOSITY_PA_S = 1.81e-5
 
 # 2026 FUEL nominal dimensions used by the original model.
-FUEL_DIAMETER_M = 0.150
-FUEL_MASS_KG = 0.215
+FUEL_DIAMETER_M = 5.91 * 0.0254  # official nominal diameter
+FUEL_MASS_MIN_KG = 0.448 * 0.45359237
+FUEL_MASS_MAX_KG = 0.500 * 0.45359237
+FUEL_MASS_KG = 0.5 * (FUEL_MASS_MIN_KG + FUEL_MASS_MAX_KG)
 
 # HUB top opening values used by the original model.
 HUB_OPENING_FLAT_TO_FLAT_M = 41.7 * 0.0254
@@ -338,6 +341,7 @@ class PiecewiseCubicCalibration:
         y: Sequence[float],
         source: str,
         extrapolate: bool = False,
+        enforce_increasing: bool = True,
     ) -> "PiecewiseCubicCalibration":
         x_arr = np.asarray(x, dtype=float)
         y_arr = np.asarray(y, dtype=float)
@@ -350,9 +354,9 @@ class PiecewiseCubicCalibration:
         unique_y = np.array([np.median(y_arr[np.isclose(x_arr, xx)]) for xx in unique_x])
         if len(unique_x) < 2:
             raise ValueError("PCHIP calibration needs at least two unique x values")
-        if np.any(np.diff(unique_y) <= 0.0):
-            # Isotonic-lite: enforce tiny strictly increasing increments.  This is
-            # intentionally conservative; the calibration report calls it out.
+        if enforce_increasing and np.any(np.diff(unique_y) <= 0.0):
+            # Isotonic-lite for physical RPM->speed/spin curves only. Scatter
+            # curves may legitimately rise and fall with RPM.
             unique_y = np.maximum.accumulate(unique_y)
             for i in range(1, len(unique_y)):
                 if unique_y[i] <= unique_y[i - 1]:
@@ -403,6 +407,10 @@ class ShooterCalibration:
     fallback_speed_per_rpm: float
     fallback_spin_per_rpm: float
     source: str
+    speed_sigma_fraction_curve: PiecewiseCubicCalibration | None = None
+    spin_sigma_fraction_curve: PiecewiseCubicCalibration | None = None
+    fallback_speed_sigma_fraction: float = 0.018
+    fallback_spin_sigma_fraction: float = 0.10
 
     def speed_from_rpm(self, rpm: np.ndarray | float) -> np.ndarray:
         if self.speed_curve is not None:
@@ -413,6 +421,18 @@ class ShooterCalibration:
         if self.spin_curve is not None:
             return self.spin_curve.evaluate(rpm)
         return np.asarray(rpm, dtype=float) * self.fallback_spin_per_rpm
+
+    def speed_sigma_fraction_from_rpm(self, rpm: np.ndarray | float) -> np.ndarray:
+        values = np.asarray(rpm, dtype=float)
+        if self.speed_sigma_fraction_curve is not None:
+            return np.maximum(1e-4, self.speed_sigma_fraction_curve.evaluate(values))
+        return np.full_like(values, self.fallback_speed_sigma_fraction, dtype=float)
+
+    def spin_sigma_fraction_from_rpm(self, rpm: np.ndarray | float) -> np.ndarray:
+        values = np.asarray(rpm, dtype=float)
+        if self.spin_sigma_fraction_curve is not None:
+            return np.maximum(1e-4, self.spin_sigma_fraction_curve.evaluate(values))
+        return np.full_like(values, self.fallback_spin_sigma_fraction, dtype=float)
 
     def rpm_from_speed(self, speed_mps: float, bounds: tuple[float, float]) -> float:
         low, high = bounds
@@ -431,30 +451,68 @@ class ShooterCalibration:
 
 @dataclass(frozen=True)
 class EmpiricalCorrection:
-    x: tuple[float, ...] = ()
-    y: tuple[float, ...] = ()
+    x: tuple[float, ...] = ()          # distance
+    y: tuple[float, ...] = ()          # RPM residual
+    angle_deg: tuple[float, ...] = ()  # angle associated with each point
     max_abs_correction_rpm: float = 400.0
 
-    def correction_rpm(self, distance_m: np.ndarray | float) -> np.ndarray:
-        value = np.asarray(distance_m, dtype=float)
+    def correction_rpm(
+        self,
+        distance_m: np.ndarray | float,
+        angle_deg: np.ndarray | float | None = None,
+    ) -> np.ndarray:
+        distance = np.asarray(distance_m, dtype=float)
         if len(self.x) < 2:
-            return np.zeros_like(value)
+            return np.zeros_like(distance)
+
+        # If calibration spans multiple angles, use smooth inverse-distance
+        # weighting in (distance, angle) space. Otherwise retain the stable 1-D
+        # PCHIP correction used by the original fixed-70-degree model.
+        if len(self.angle_deg) == len(self.x) and len(np.unique(self.angle_deg)) >= 2 and angle_deg is not None:
+            angle = np.asarray(angle_deg, dtype=float)
+            d_b, a_b = np.broadcast_arrays(distance, angle)
+            out = np.empty_like(d_b, dtype=float)
+            pts_d = np.asarray(self.x, dtype=float)
+            pts_a = np.asarray(self.angle_deg, dtype=float)
+            values = np.asarray(self.y, dtype=float)
+            for index in np.ndindex(d_b.shape):
+                dd = (pts_d - float(d_b[index])) / 0.50
+                aa = (pts_a - float(a_b[index])) / 3.0
+                r2 = dd * dd + aa * aa
+                exact = np.flatnonzero(r2 < 1e-12)
+                if len(exact):
+                    value = float(np.median(values[exact]))
+                else:
+                    # Four nearest points prevent distant calibration regions from
+                    # dominating while remaining smooth across sparse angle grids.
+                    nearest = np.argsort(r2)[: min(4, len(r2))]
+                    weights = 1.0 / np.maximum(r2[nearest], 1e-6)
+                    value = float(np.sum(weights * values[nearest]) / np.sum(weights))
+                out[index] = value
+            return np.clip(out, -self.max_abs_correction_rpm, self.max_abs_correction_rpm)
+
         pchip = PchipInterpolator(np.asarray(self.x), np.asarray(self.y), extrapolate=True)
-        corrected = np.asarray(pchip(value), dtype=float)
+        corrected = np.asarray(pchip(distance), dtype=float)
         return np.clip(corrected, -self.max_abs_correction_rpm, self.max_abs_correction_rpm)
 
 
 @dataclass(frozen=True)
 class UncertaintyModel:
-    # Model uncertainty.
-    mass_sigma_kg: float = 0.006
-    cd_reference_sigma: float = 0.035
-    cd_log_re_slope_sigma: float = 0.012
-    magnus_slope_sigma: float = 0.022
-    spin_decay_fraction_sigma: float = 0.18
-    calibration_speed_scale_sigma: float = 0.015
+    # Model uncertainty. The official FUEL mass range is sampled directly in the
+    # Monte Carlo; these values represent remaining model uncertainty.
+    mass_sigma_kg: float = 0.004
+    diameter_sigma_m: float = 0.0020
+    cd_reference_sigma: float = 0.030
+    cd_log_re_slope_sigma: float = 0.010
+    magnus_slope_sigma: float = 0.020
+    spin_decay_fraction_sigma: float = 0.15
+    calibration_speed_scale_sigma: float = 0.008
+    spin_scale_sigma: float = 0.06
+    spin_axis_tilt_sigma_deg: float = 2.0
 
-    # Default independent shot noise.  Real covariance can override this.
+    # Default independent shot noise. Real covariance overrides these where there
+    # is enough data. Exit-speed scatter is additionally conditioned on RPM using
+    # repeated chronograph/high-speed-video measurements when available.
     rpm_sigma: float = 12.0
     exit_speed_fraction_sigma: float = 0.018
     launch_angle_sigma_deg: float = 0.70
@@ -487,6 +545,12 @@ class ShotErrorDistribution:
     covariance_flat: tuple[float, ...]
     dimension: int
     source_rows: int = 0
+    # Optional empirical P(score | lip margin, entry angle). These coefficients
+    # complement the rigid contact model when enough real scored/missed shots exist.
+    score_model_coefficients: tuple[float, ...] = ()
+    score_model_feature_mean: tuple[float, ...] = ()
+    score_model_feature_scale: tuple[float, ...] = ()
+    score_model_rows: int = 0
 
     @classmethod
     def from_diagonal(cls, uncertainty: UncertaintyModel) -> "ShotErrorDistribution":
@@ -513,6 +577,23 @@ class ShotErrorDistribution:
 
     def mean_array(self) -> np.ndarray:
         return np.asarray(self.mean, dtype=float)
+
+    def empirical_score_probability(
+        self, margin_m: np.ndarray, entry_angle_deg: np.ndarray
+    ) -> np.ndarray | None:
+        if len(self.score_model_coefficients) != 3:
+            return None
+        feature = np.column_stack((np.asarray(margin_m).ravel(), np.asarray(entry_angle_deg).ravel()))
+        mean = np.asarray(self.score_model_feature_mean, dtype=float)
+        scale = np.asarray(self.score_model_feature_scale, dtype=float)
+        if mean.shape != (2,) or scale.shape != (2,):
+            return None
+        z = (feature - mean) / np.maximum(scale, 1e-9)
+        beta = np.asarray(self.score_model_coefficients, dtype=float)
+        logits = beta[0] + z @ beta[1:]
+        logits = np.clip(logits, -30.0, 30.0)
+        probability = 1.0 / (1.0 + np.exp(-logits))
+        return probability.reshape(np.broadcast_shapes(np.asarray(margin_m).shape, np.asarray(entry_angle_deg).shape))
 
 
 @dataclass(frozen=True)
@@ -550,6 +631,8 @@ class TrajectoryResult:
     funnel_contacts: int
     t_s: np.ndarray | None = None
     states: np.ndarray | None = None
+    full_path_m: np.ndarray | None = None
+    full_path_t_s: np.ndarray | None = None
 
 
 @dataclass
@@ -603,7 +686,58 @@ def _valid_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return x[mask], y[mask]
 
 
-def fit_measured_calibration(rows: CalibrationRows) -> tuple[PiecewiseCubicCalibration | None, PiecewiseCubicCalibration | None]:
+def _fit_fraction_scatter_curve(
+    x: np.ndarray,
+    y: np.ndarray,
+    mean_curve: PiecewiseCubicCalibration | None,
+    source_name: str,
+) -> PiecewiseCubicCalibration | None:
+    """Fit an RPM-conditioned fractional 1-sigma scatter curve.
+
+    Repeated samples at the same commanded RPM are preferred. Groups with fewer
+    than 3 observations are ignored because two-shot ranges are not stable sigma
+    estimates. The curve is intentionally smoothed by medians and PCHIP.
+    """
+    if mean_curve is None:
+        return None
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    sigma_x: list[float] = []
+    sigma_y: list[float] = []
+    for rpm_value in np.unique(x):
+        mask = np.isclose(x, rpm_value, atol=1e-9)
+        values = y[mask]
+        if len(values) < 3:
+            continue
+        center = float(mean_curve.evaluate(float(rpm_value)))
+        if abs(center) < 1e-9:
+            continue
+        # MAD is robust to an occasional bad video/chronograph measurement.
+        residual = values - center
+        mad = float(np.median(np.abs(residual - np.median(residual))))
+        sigma = max(1e-4, 1.4826 * mad / abs(center))
+        sigma_x.append(float(rpm_value))
+        sigma_y.append(sigma)
+    if len(sigma_x) < 2:
+        return None
+    return PiecewiseCubicCalibration.from_points(
+        sigma_x,
+        sigma_y,
+        source=f"RPM-conditioned fractional scatter from {source_name}",
+        extrapolate=False,
+        enforce_increasing=False,
+    )
+
+
+def fit_measured_calibration(
+    rows: CalibrationRows,
+) -> tuple[
+    PiecewiseCubicCalibration | None,
+    PiecewiseCubicCalibration | None,
+    PiecewiseCubicCalibration | None,
+    PiecewiseCubicCalibration | None,
+]:
     rpm = rows.column("rpm")
     speed = rows.column("exit_speed_mps")
     spin = rows.column("spin_rpm")
@@ -627,7 +761,10 @@ def fit_measured_calibration(rows: CalibrationRows) -> tuple[PiecewiseCubicCalib
             source=f"PCHIP fit to {len(spin_rpm)} measured spin rows",
             extrapolate=False,
         )
-    return speed_curve, spin_curve
+
+    speed_sigma_curve = _fit_fraction_scatter_curve(speed_rpm, speed_values, speed_curve, "exit-speed repeats")
+    spin_sigma_curve = _fit_fraction_scatter_curve(spin_rpm, spin_values, spin_curve, "spin repeats")
+    return speed_curve, spin_curve, speed_sigma_curve, spin_sigma_curve
 
 
 # ===========================================================================
@@ -740,38 +877,105 @@ def _funnel_apothem_at_z(z_m: float, hub: HubGeometry) -> float:
     return hub.opening_apothem_m + fraction * (hub.throat_apothem_m - hub.opening_apothem_m)
 
 
+def _apply_sphere_contact_impulse(
+    velocity: np.ndarray,
+    spin_rad_s_xyz: np.ndarray,
+    normal_into_free_space: np.ndarray,
+    mass_kg: float,
+    radius_m: float,
+    restitution: float,
+    friction: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Impulse response for a solid sphere, including spin/friction coupling."""
+    n = np.asarray(normal_into_free_space, dtype=float)
+    n /= max(float(np.linalg.norm(n)), 1e-12)
+    v = np.asarray(velocity, dtype=float).copy()
+    w = np.asarray(spin_rad_s_xyz, dtype=float).copy()
+    r_contact = -radius_m * n
+    v_contact = v + np.cross(w, r_contact)
+    vn = float(np.dot(v_contact, n))
+    if vn >= 0.0:
+        return v, w
+
+    jn_mag = -(1.0 + restitution) * mass_kg * vn
+    jn = jn_mag * n
+    vt = v_contact - vn * n
+    vt_mag = float(np.linalg.norm(vt))
+    jt = np.zeros(3, dtype=float)
+    if vt_mag > 1e-12 and friction > 0.0:
+        # Solid sphere: I = 2/5 mr^2, so tangential effective mass = 2m/7.
+        tangential_effective_mass = (2.0 / 7.0) * mass_kg
+        desired = -tangential_effective_mass * vt
+        desired_mag = float(np.linalg.norm(desired))
+        limit = max(0.0, friction * jn_mag)
+        if desired_mag > limit and desired_mag > 1e-12:
+            desired *= limit / desired_mag
+        jt = desired
+
+    impulse = jn + jt
+    v += impulse / mass_kg
+    inertia = (2.0 / 5.0) * mass_kg * radius_m * radius_m
+    if inertia > 1e-12:
+        w += np.cross(r_contact, jt) / inertia
+    return v, w
+
+
+def _rk4_free_flight_step(
+    position: np.ndarray,
+    velocity: np.ndarray,
+    spin: np.ndarray,
+    dt_s: float,
+    ball: BallModel,
+    aero: AeroModel,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    state = np.concatenate((position, velocity, spin))
+
+    def deriv(st: np.ndarray) -> np.ndarray:
+        acc, spin_dot = acceleration_and_spin_derivative(st[3:6], st[6:9], ball, aero)
+        return np.concatenate((st[3:6], acc, spin_dot))
+
+    k1 = deriv(state)
+    k2 = deriv(state + 0.5 * dt_s * k1)
+    k3 = deriv(state + 0.5 * dt_s * k2)
+    k4 = deriv(state + dt_s * k3)
+    nxt = state + (dt_s / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return nxt[:3], nxt[3:6], nxt[6:9]
+
+
 def _resolve_funnel_contact(
     position: np.ndarray,
     velocity: np.ndarray,
+    spin: np.ndarray,
     ball: BallModel,
     hub: HubGeometry,
-) -> tuple[np.ndarray, np.ndarray, bool]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
     z = float(position[2])
     if z > hub.lip_height_m or z < hub.funnel_bottom_z_m:
-        return position, velocity, False
+        return position, velocity, spin, False
 
     allowed = _funnel_apothem_at_z(z, hub) - ball.radius_m
     projection, normal_xy = _max_hex_projection(float(position[0]), float(position[1]))
     penetration = projection - allowed
     if penetration <= 0.0:
-        return position, velocity, False
+        return position, velocity, spin, False
 
-    # Approximate sloped-wall normal.  apothem grows with z; the wall normal has
-    # an inward/downward component when viewed from the valid interior volume.
     da_dz = (hub.opening_apothem_m - hub.throat_apothem_m) / max(hub.funnel_depth_m, 1e-9)
     outward = np.array([normal_xy[0], normal_xy[1], -da_dz], dtype=float)
     outward /= max(float(np.linalg.norm(outward)), 1e-12)
+    normal_free = -outward
 
-    # Push sphere center back into valid interior.
+    # Conservative projection back toward the valid volume.
     position = position - penetration * np.array([normal_xy[0], normal_xy[1], 0.0])
-
-    vn = float(np.dot(velocity, outward))
-    if vn > 0.0:
-        # Moving outward into wall: reflect normal component and damp tangent.
-        normal_component = vn * outward
-        tangent = velocity - normal_component
-        velocity = (1.0 - hub.friction) * tangent - hub.restitution * normal_component
-    return position, velocity, True
+    velocity, spin = _apply_sphere_contact_impulse(
+        velocity,
+        spin,
+        normal_free,
+        ball.mass_kg,
+        ball.radius_m,
+        hub.restitution,
+        hub.friction,
+    )
+    return position, velocity, spin, True
 
 
 def simulate_hub_contact_after_lip(
@@ -781,14 +985,16 @@ def simulate_hub_contact_after_lip(
     ball: BallModel,
     aero: AeroModel,
     hub: HubGeometry,
-    dt_s: float = 0.0015,
+    dt_s: float = 0.0005,
     max_time_s: float = 0.65,
-) -> tuple[bool, str, int, int, np.ndarray, np.ndarray]:
-    """Continue a descending shot through rim/funnel contacts.
+    save_trace: bool = False,
+) -> tuple[bool, str, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Continue a descending shot through the HUB with spin-aware contacts.
 
-    This is a compact rigid-contact approximation, not a compliant foam/contact
-    FEA model.  It is intentionally parameterized so restitution/friction can be
-    fitted from real rim-hit data later.
+    The top opening dimensions are official; the internal funnel remains a
+    parameterized approximation unless the team replaces those dimensions with CAD
+    measurements. Contact response uses a rigid solid-sphere impulse with Coulomb
+    friction and angular impulse rather than the old velocity-damping heuristic.
     """
     position = np.asarray(position_at_lip, dtype=float).copy()
     velocity = np.asarray(velocity_at_lip, dtype=float).copy()
@@ -798,19 +1004,15 @@ def simulate_hub_contact_after_lip(
 
     clean_margin = float(hub.signed_opening_margin_m(position[0], position[1], ball.radius_m))
     initially_clean = clean_margin >= 0.0
+    trace_p: list[np.ndarray] = [position.copy()] if save_trace else []
+    trace_t: list[float] = [0.0] if save_trace else []
 
-    steps = int(math.ceil(max_time_s / dt_s))
-    previous = position.copy()
-    for _ in range(steps):
-        acceleration, spin_dot = acceleration_and_spin_derivative(velocity, spin, ball, aero)
-        velocity += dt_s * acceleration
-        spin += dt_s * spin_dot
-        previous[:] = position
-        position += dt_s * velocity
+    t = 0.0
+    while t < max_time_s:
+        step = min(dt_s, max_time_s - t)
+        position, velocity, spin = _rk4_free_flight_step(position, velocity, spin, step, ball, aero)
+        t += step
 
-        # Horizontal rim plate occupies the annular region around the top opening
-        # and has real vertical thickness.  Detect downward intersection with its
-        # top/bottom slab while the sphere overlaps the annulus.
         projection, normal_xy = _max_hex_projection(float(position[0]), float(position[1]))
         inner = hub.opening_apothem_m - ball.radius_m
         outer = hub.opening_apothem_m + hub.rim_radial_width_m + ball.radius_m
@@ -823,23 +1025,37 @@ def simulate_hub_contact_after_lip(
         in_rim_annulus = projection > inner and projection < outer
         if sphere_overlaps_rim_z and in_rim_annulus and velocity[2] < 0.0:
             rim_contacts += 1
-            # Put center just above rim top and bounce vertical velocity.  Also
-            # damp horizontal tangent to represent soft foam/polycarbonate contact.
-            position[2] = rim_top + ball.radius_m + 1e-5
-            velocity[2] = -hub.restitution * velocity[2]
-            velocity[:2] *= max(0.0, 1.0 - hub.friction)
-            # Small inward component if hit is close enough to the inner lip.
-            if projection < hub.opening_apothem_m + 0.5 * hub.rim_radial_width_m:
-                velocity[:2] -= 0.25 * abs(velocity[2]) * normal_xy
+            position[2] = rim_top + ball.radius_m + 1e-6
+            velocity, spin = _apply_sphere_contact_impulse(
+                velocity,
+                spin,
+                np.array([0.0, 0.0, 1.0]),
+                ball.mass_kg,
+                ball.radius_m,
+                hub.restitution,
+                hub.friction,
+            )
+            # Near the inner edge, the contact normal is not perfectly horizontal;
+            # add a small geometric inward component rather than a magic velocity
+            # damping term. This remains an approximation until exact rim CAD is used.
+            if projection < hub.opening_apothem_m + 0.35 * hub.rim_radial_width_m:
+                side_normal = np.array([-normal_xy[0], -normal_xy[1], 0.35], dtype=float)
+                velocity, spin = _apply_sphere_contact_impulse(
+                    velocity, spin, side_normal, ball.mass_kg, ball.radius_m,
+                    0.5 * hub.restitution, 0.7 * hub.friction,
+                )
 
-        position, velocity, contacted = _resolve_funnel_contact(position, velocity, ball, hub)
+        position, velocity, spin, contacted = _resolve_funnel_contact(position, velocity, spin, ball, hub)
         if contacted:
             funnel_contacts += 1
 
-        # Successful exit through funnel throat.
+        if save_trace:
+            trace_p.append(position.copy())
+            trace_t.append(t)
+
         if position[2] <= hub.funnel_bottom_z_m - ball.radius_m:
             projection, _ = _max_hex_projection(float(position[0]), float(position[1]))
-            if projection <= hub.throat_apothem_m - 0.15 * ball.radius_m and velocity[2] < 0.0:
+            if projection <= hub.throat_apothem_m - 0.10 * ball.radius_m and velocity[2] < 0.0:
                 if rim_contacts == 0 and funnel_contacts == 0 and initially_clean:
                     classification = "clean_score"
                 elif rim_contacts > 0 and funnel_contacts > 0:
@@ -848,17 +1064,28 @@ def simulate_hub_contact_after_lip(
                     classification = "rim_score"
                 else:
                     classification = "funnel_score"
-                return True, classification, rim_contacts, funnel_contacts, position, velocity
-            return False, "miss", rim_contacts, funnel_contacts, position, velocity
+                return (
+                    True, classification, rim_contacts, funnel_contacts, position, velocity, spin,
+                    np.asarray(trace_t) if save_trace else None,
+                    np.asarray(trace_p) if save_trace else None,
+                )
+            return (
+                False, "miss", rim_contacts, funnel_contacts, position, velocity, spin,
+                np.asarray(trace_t) if save_trace else None,
+                np.asarray(trace_p) if save_trace else None,
+            )
 
-        # Escaped above the top after a rim bounce or exited too far radially.
         max_projection, _ = _max_hex_projection(float(position[0]), float(position[1]))
         if position[2] > hub.lip_height_m + 0.35 and velocity[2] > 0.0:
-            return False, "miss", rim_contacts, funnel_contacts, position, velocity
+            break
         if max_projection > hub.opening_apothem_m + hub.rim_radial_width_m + 0.50:
-            return False, "miss", rim_contacts, funnel_contacts, position, velocity
+            break
 
-    return False, "miss", rim_contacts, funnel_contacts, position, velocity
+    return (
+        False, "miss", rim_contacts, funnel_contacts, position, velocity, spin,
+        np.asarray(trace_t) if save_trace else None,
+        np.asarray(trace_p) if save_trace else None,
+    )
 
 
 # ===========================================================================
@@ -1070,6 +1297,7 @@ def simulate_shot(
     initial_spin_rpm = default_spin_axis_from_yaw(yaw_deg) * float(calibration.spin_from_rpm(flywheel_rpm))
 
     if not reached:
+        path = states[:, :3].copy() if save_trajectory and states is not None else None
         return TrajectoryResult(
             reached_hub=False,
             scored=False,
@@ -1089,6 +1317,8 @@ def simulate_shot(
             funnel_contacts=0,
             t_s=t_s,
             states=states,
+            full_path_m=path,
+            full_path_t_s=t_s.copy() if save_trajectory and t_s is not None else None,
         )
 
     margin = float(hub.signed_opening_margin_m(position[0], position[1], ball.radius_m))
@@ -1096,14 +1326,37 @@ def simulate_shot(
     entry = math.degrees(math.atan2(-velocity[2], max(horizontal, 1e-12)))
     impact = float(np.linalg.norm(velocity))
 
-    scored, classification, rim_contacts, funnel_contacts, _, final_velocity = simulate_hub_contact_after_lip(
+    (
+        scored,
+        classification,
+        rim_contacts,
+        funnel_contacts,
+        _,
+        _,
+        final_spin,
+        contact_t,
+        contact_path,
+    ) = simulate_hub_contact_after_lip(
         position,
         velocity,
         spin_rad,
         ball,
         aero,
         hub,
+        save_trace=save_trajectory,
     )
+
+    full_path = None
+    full_time = None
+    if save_trajectory:
+        pre_path = states[:, :3] if states is not None else np.asarray([shooter_exit_position(distance_m, shooter), position])
+        pre_time = t_s if t_s is not None else np.linspace(0.0, flight_time, len(pre_path))
+        if contact_path is not None and len(contact_path) > 1:
+            full_path = np.vstack((pre_path, contact_path[1:]))
+            full_time = np.concatenate((pre_time, flight_time + contact_t[1:]))
+        else:
+            full_path = np.asarray(pre_path, dtype=float)
+            full_time = np.asarray(pre_time, dtype=float)
 
     return TrajectoryResult(
         reached_hub=True,
@@ -1118,12 +1371,14 @@ def simulate_shot(
         opening_margin_m=margin,
         launch_speed_mps=launch_speed,
         initial_spin_rpm_xyz=initial_spin_rpm,
-        final_spin_rpm_xyz=spin_rad * 60.0 / (2.0 * math.pi),
+        final_spin_rpm_xyz=final_spin * 60.0 / (2.0 * math.pi),
         yaw_deg=float(yaw_deg),
         rim_contacts=rim_contacts,
         funnel_contacts=funnel_contacts,
         t_s=t_s,
         states=states,
+        full_path_m=full_path,
+        full_path_t_s=full_time,
     )
 
 
@@ -1201,16 +1456,23 @@ def build_calibration(
     hub: HubGeometry,
     shooter: ShooterGeometry,
 ) -> ShooterCalibration:
-    speed_curve, spin_curve = fit_measured_calibration(rows)
+    speed_curve, spin_curve, speed_sigma_curve, spin_sigma_curve = fit_measured_calibration(rows)
     fallback = fallback_calibration(ball, aero, hub, shooter)
     if speed_curve is None:
-        return replace(fallback, spin_curve=spin_curve)
+        return replace(
+            fallback,
+            spin_curve=spin_curve,
+            speed_sigma_fraction_curve=speed_sigma_curve,
+            spin_sigma_fraction_curve=spin_sigma_curve,
+        )
     return ShooterCalibration(
         speed_curve=speed_curve,
         spin_curve=spin_curve,
         fallback_speed_per_rpm=fallback.fallback_speed_per_rpm,
         fallback_spin_per_rpm=fallback.fallback_spin_per_rpm,
         source=speed_curve.source,
+        speed_sigma_fraction_curve=speed_sigma_curve,
+        spin_sigma_fraction_curve=spin_sigma_curve,
     )
 
 
@@ -1223,7 +1485,15 @@ def estimate_shot_error_distribution(
     rows: CalibrationRows,
     calibration: ShooterCalibration,
     uncertainty: UncertaintyModel,
+    hub: HubGeometry,
+    ball: BallModel,
 ) -> ShotErrorDistribution:
+    """Learn shot noise without double-counting RPM-induced exit-speed changes.
+
+    Covariances are estimated pairwise so one missing sensor column does not throw
+    away an otherwise useful shot. A data-dependent shrinkage toward the diagonal
+    prevents small datasets from producing extreme/unstable correlations.
+    """
     default = ShotErrorDistribution.from_diagonal(uncertainty)
     if rows.count < 8:
         return default
@@ -1244,9 +1514,15 @@ def estimate_shot_error_distribution(
     matrix = np.full((rows.count, len(SHOT_ERROR_NAMES)), np.nan, dtype=float)
     matrix[:, 0] = actual_rpm - commanded_rpm
 
-    predicted_speed = calibration.speed_from_rpm(commanded_rpm)
-    valid_prediction = np.isfinite(predicted_speed) & (predicted_speed > 1e-6)
-    matrix[valid_prediction, 1] = (speed[valid_prediction] - predicted_speed[valid_prediction]) / predicted_speed[valid_prediction]
+    # IMPORTANT: when actual RPM is measured, compare measured ball speed against
+    # speed_from_rpm(actual_rpm), not the commanded RPM. Otherwise an RPM sag is
+    # counted once as rpm_error and a second time as exit-speed error.
+    speed_reference_rpm = np.where(np.isfinite(actual_rpm), actual_rpm, commanded_rpm)
+    predicted_speed = calibration.speed_from_rpm(speed_reference_rpm)
+    valid_prediction = np.isfinite(speed) & np.isfinite(predicted_speed) & (predicted_speed > 1e-6)
+    matrix[valid_prediction, 1] = (
+        speed[valid_prediction] - predicted_speed[valid_prediction]
+    ) / predicted_speed[valid_prediction]
     matrix[:, 2] = actual_angle - command_angle
     matrix[:, 3] = yaw_error
     matrix[:, 4] = distance_error
@@ -1256,46 +1532,112 @@ def estimate_shot_error_distribution(
     matrix[:, 8] = robot_vy_error
     matrix[:, 9] = np.deg2rad(robot_omega_error_deg)
 
-    # Fill columns with insufficient measurements from the default distribution.
     default_cov = default.covariance()
-    default_mean = default.mean_array()
-    usable_columns = []
-    means = np.zeros(matrix.shape[1], dtype=float)
-    standard = np.sqrt(np.diag(default_cov))
+    means = default.mean_array().copy()
+    covariance = default_cov.copy()
+    finite_counts = np.zeros(matrix.shape[1], dtype=int)
+
     for col in range(matrix.shape[1]):
         finite = np.isfinite(matrix[:, col])
-        if np.count_nonzero(finite) >= 6:
-            means[col] = float(np.mean(matrix[finite, col]))
-            measured_std = float(np.std(matrix[finite, col], ddof=1))
-            standard[col] = max(measured_std, 1e-9)
-            usable_columns.append(col)
-        else:
-            matrix[:, col] = np.where(np.isfinite(matrix[:, col]), matrix[:, col], default_mean[col])
+        n = int(np.count_nonzero(finite))
+        finite_counts[col] = n
+        if n >= 6:
+            values = matrix[finite, col]
+            means[col] = float(np.mean(values))
+            measured_var = float(np.var(values, ddof=1))
+            # Shrink small samples toward the conservative default variance.
+            weight = n / (n + 12.0)
+            covariance[col, col] = weight * measured_var + (1.0 - weight) * default_cov[col, col]
 
-    covariance = default_cov.copy()
-    if len(usable_columns) >= 2:
-        complete_mask = np.all(np.isfinite(matrix[:, usable_columns]), axis=1)
-        if np.count_nonzero(complete_mask) >= 6:
-            measured = matrix[complete_mask][:, usable_columns]
-            measured_cov = np.cov(measured, rowvar=False)
-            if measured_cov.ndim == 0:
-                measured_cov = np.array([[float(measured_cov)]])
-            for i, col_i in enumerate(usable_columns):
-                for j, col_j in enumerate(usable_columns):
-                    covariance[col_i, col_j] = float(measured_cov[i, j])
+    for i in range(matrix.shape[1]):
+        for j in range(i + 1, matrix.shape[1]):
+            finite = np.isfinite(matrix[:, i]) & np.isfinite(matrix[:, j])
+            n = int(np.count_nonzero(finite))
+            if n < 8:
+                covariance[i, j] = covariance[j, i] = 0.0
+                continue
+            vi = matrix[finite, i]
+            vj = matrix[finite, j]
+            measured_cov = float(np.cov(vi, vj, ddof=1)[0, 1])
+            # More overlap => less shrinkage of correlation.
+            weight = n / (n + 20.0)
+            value = weight * measured_cov
+            covariance[i, j] = covariance[j, i] = value
 
-    # Ensure positive semi-definite via eigenvalue clipping.
     covariance = 0.5 * (covariance + covariance.T)
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    floor = max(float(np.max(eigenvalues)) * 1e-9, 1e-12)
+    floor = max(float(np.max(eigenvalues)) * 1e-8, 1e-12)
     covariance = (eigenvectors * np.maximum(eigenvalues, floor)) @ eigenvectors.T
 
-    measured_rows = int(max((np.count_nonzero(np.isfinite(matrix[:, c])) for c in usable_columns), default=0))
+    # Optional empirical score/contact model. It learns only from real rows that
+    # have measured lip x/y, entry angle, and an unambiguous score/miss label.
+    # This is deliberately low-dimensional to avoid overfitting small FRC datasets.
+    score_beta: tuple[float, ...] = ()
+    score_mean: tuple[float, ...] = ()
+    score_scale: tuple[float, ...] = ()
+    score_rows = 0
+    lip_x = rows.column("lip_x_m")
+    lip_y = rows.column("lip_y_m")
+    entry_angle = rows.column("entry_angle_deg")
+    explicit_score = rows.column("scored")
+    result_labels = rows.text_column("result")
+    labels = np.full(rows.count, np.nan, dtype=float)
+    for idx in range(rows.count):
+        if np.isfinite(explicit_score[idx]):
+            labels[idx] = 1.0 if explicit_score[idx] >= 0.5 else 0.0
+        else:
+            label = result_labels[idx]
+            if any(token in label for token in ("miss", "fail", "no_score", "noscore")):
+                labels[idx] = 0.0
+            elif any(token in label for token in ("score", "center", "good", "bullseye", "made")):
+                labels[idx] = 1.0
+
+    score_mask = (
+        np.isfinite(lip_x) & np.isfinite(lip_y) & np.isfinite(entry_angle) & np.isfinite(labels)
+    )
+    if np.count_nonzero(score_mask) >= 30:
+        y_score = labels[score_mask]
+        positives = int(np.count_nonzero(y_score >= 0.5))
+        negatives = int(np.count_nonzero(y_score < 0.5))
+        if positives >= 5 and negatives >= 5:
+            margin = hub.signed_opening_margin_m(
+                lip_x[score_mask], lip_y[score_mask], ball.radius_m
+            )
+            Xraw = np.column_stack((margin, entry_angle[score_mask]))
+            mean_feature = np.mean(Xraw, axis=0)
+            scale_feature = np.std(Xraw, axis=0, ddof=1)
+            scale_feature = np.maximum(scale_feature, np.array([0.015, 1.0]))
+            Z = (Xraw - mean_feature) / scale_feature
+            X = np.column_stack((np.ones(len(Z)), Z))
+            beta = np.zeros(3, dtype=float)
+            ridge = np.diag([0.0, 0.35, 0.35])
+            for _ in range(30):
+                logits = np.clip(X @ beta, -25.0, 25.0)
+                probability = 1.0 / (1.0 + np.exp(-logits))
+                weights = np.maximum(probability * (1.0 - probability), 1e-5)
+                gradient = X.T @ (probability - y_score) + ridge @ beta
+                hessian = (X.T * weights) @ X + ridge
+                try:
+                    step = np.linalg.solve(hessian, gradient)
+                except np.linalg.LinAlgError:
+                    break
+                beta -= step
+                if float(np.linalg.norm(step)) < 1e-7:
+                    break
+            score_beta = tuple(float(v) for v in beta)
+            score_mean = tuple(float(v) for v in mean_feature)
+            score_scale = tuple(float(v) for v in scale_feature)
+            score_rows = int(len(y_score))
+
     return ShotErrorDistribution(
         mean=tuple(float(v) for v in means),
         covariance_flat=tuple(float(v) for v in covariance.ravel()),
         dimension=len(SHOT_ERROR_NAMES),
-        source_rows=measured_rows,
+        source_rows=int(np.max(finite_counts)),
+        score_model_coefficients=score_beta,
+        score_model_feature_mean=score_mean,
+        score_model_feature_scale=score_scale,
+        score_model_rows=score_rows,
     )
 
 
@@ -1316,72 +1658,138 @@ def fit_physics_from_logs(
     initial_aero: AeroModel,
     hub: HubGeometry,
     shooter: ShooterGeometry,
-    max_rows: int = 40,
+    max_rows: int = 120,
 ) -> AeroModel:
-    centered = _centered_row_mask(rows)
-    distance = rows.column("distance_m")
-    rpm = rows.column("rpm")
-    angle = rows.column("angle_deg")
-    entry = rows.column("entry_angle_deg")
-    flight = rows.column("flight_time_s")
-    lip_x = rows.column("lip_x_m")
-    lip_y = rows.column("lip_y_m")
+    """Fast robust/regularized aerodynamic fit from measured trajectory data.
 
-    mask = centered & np.isfinite(distance) & np.isfinite(rpm)
+    Missing lip coordinates are never interpreted as zero. The fit batches all
+    calibration trajectories through the same RK4/JIT physics kernel used by robust
+    optimization, making auto-calibration practical instead of running thousands of
+    nested ``solve_ivp`` calls. The final delivered nominal shots still use the
+    tighter adaptive ``solve_ivp`` solver.
+    """
+    distance_all = rows.column("distance_m")
+    rpm_all = rows.column("rpm")
+    angle_all = rows.column("angle_deg")
+    entry_all = rows.column("entry_angle_deg")
+    flight_all = rows.column("flight_time_s")
+    lip_x_all = rows.column("lip_x_m")
+    lip_y_all = rows.column("lip_y_m")
+
+    informative = (
+        np.isfinite(lip_x_all) | np.isfinite(lip_y_all)
+        | np.isfinite(entry_all) | np.isfinite(flight_all)
+    )
+    mask = np.isfinite(distance_all) & np.isfinite(rpm_all) & informative
     indices = np.flatnonzero(mask)[:max_rows]
-    if len(indices) < 4:
-        warnings.warn("--auto-calibrate: fewer than 4 centered rows; skipping physics fit")
+    if len(indices) < 8:
+        warnings.warn(
+            "--auto-calibrate: fewer than 8 rows contain measured lip position, entry angle, or flight time; "
+            "skipping aerodynamic fit rather than fitting physics to categorical score labels"
+        )
         return initial_aero
 
-    robot = RobotState()
+    distance = distance_all[indices]
+    rpm = rpm_all[indices]
+    angle = np.where(
+        np.isfinite(angle_all[indices]), angle_all[indices], ROBOT_NOMINAL_LAUNCH_ANGLE_DEG
+    )
+    lip_x = lip_x_all[indices]
+    lip_y = lip_y_all[indices]
+    entry = entry_all[indices]
+    flight = flight_all[indices]
+    n = len(indices)
+
+    # Stationary calibration shots: yaw is geometric aim from shooter exit to HUB.
+    p0 = np.column_stack(
+        (
+            -distance + shooter.forward_offset_m,
+            np.full(n, shooter.left_offset_m),
+            np.full(n, shooter.exit_height_m),
+        )
+    )
+    target_xy = -p0[:, :2]
+    yaw = np.arctan2(target_xy[:, 1], target_xy[:, 0])
+    launch_speed = np.asarray(calibration.speed_from_rpm(rpm), dtype=float)
+    spin_rpm = np.asarray(calibration.spin_from_rpm(rpm), dtype=float)
+
+    measurement_counts = (
+        np.isfinite(lip_x).astype(int) + np.isfinite(lip_y).astype(int)
+        + np.isfinite(entry).astype(int) + np.isfinite(flight).astype(int)
+    )
 
     def residuals(vector: np.ndarray) -> np.ndarray:
-        cd_ref, cd_slope, magnus, tau, angle_bias = vector
-        aero = replace(
-            initial_aero,
-            cd_reference=float(cd_ref),
-            cd_log_re_slope=float(cd_slope),
-            magnus_lift_slope=float(magnus),
-            spin_decay_tau_s=float(tau),
-            launch_angle_bias_deg=float(angle_bias),
+        cd_ref, cd_slope, magnus, log_tau, angle_bias = vector
+        tau = math.exp(float(log_tau))
+        effective_angle = np.deg2rad(angle + float(angle_bias))
+        horizontal = np.cos(effective_angle)
+        units = np.column_stack(
+            (horizontal * np.cos(yaw), horizontal * np.sin(yaw), np.sin(effective_angle))
         )
+        velocity0 = launch_speed[:, None] * units
+        spin_axis = np.column_stack((np.sin(yaw), -np.cos(yaw), np.zeros(n)))
+        spin0 = spin_axis * (spin_rpm * 2.0 * math.pi / 60.0)[:, None]
+
+        result = _numba_batch_kernel(
+            p0,
+            velocity0,
+            spin0,
+            np.full(n, ball.mass_kg),
+            np.full(n, ball.diameter_m),
+            np.full(n, float(cd_ref)),
+            np.full(n, float(cd_slope)),
+            initial_aero.reference_reynolds,
+            np.full(n, float(magnus)),
+            initial_aero.magnus_re_slope,
+            initial_aero.max_cl,
+            np.full(n, tau),
+            np.tile(
+                np.array([initial_aero.wind_x_mps, initial_aero.wind_y_mps, initial_aero.wind_z_mps]),
+                (n, 1),
+            ),
+            hub.opening_apothem_m,
+            hub.lip_height_m,
+            hub.rim_radial_width_m,
+            hub.rim_thickness_m,
+            hub.funnel_depth_m,
+            hub.throat_apothem_m,
+            hub.restitution,
+            hub.friction,
+            0.0025,
+            3.0,
+        )
+        px, py = result[3], result[4]
+        vx, vy, vz = result[5], result[6], result[7]
+        time_s = result[8]
+        reached = np.isfinite(time_s)
+
         residual: list[float] = []
-        for index in indices:
-            commanded_angle = float(angle[index]) if np.isfinite(angle[index]) else ROBOT_NOMINAL_LAUNCH_ANGLE_DEG
-            try:
-                yaw = first_order_lead_yaw_deg(
-                    float(distance[index]), float(rpm[index]), commanded_angle, calibration, aero, shooter, robot
-                )
-                reached, position, velocity, _, time_s, _, _, _ = simulate_to_lip(
-                    float(distance[index]),
-                    float(rpm[index]),
-                    commanded_angle,
-                    yaw,
-                    calibration,
-                    ball,
-                    aero,
-                    shooter,
-                    robot,
-                    hub,
-                )
-            except (ValueError, RuntimeError):
-                residual.extend([8.0, 8.0])
+        for local in range(n):
+            if not reached[local]:
+                residual.extend([6.0] * int(measurement_counts[local]))
                 continue
-            if not reached:
-                residual.extend([8.0, 8.0])
-                continue
+            if np.isfinite(lip_x[local]):
+                residual.append((float(px[local]) - float(lip_x[local])) / 0.04)
+            if np.isfinite(lip_y[local]):
+                residual.append((float(py[local]) - float(lip_y[local])) / 0.04)
+            if np.isfinite(entry[local]):
+                h = max(float(math.hypot(vx[local], vy[local])), 1e-9)
+                predicted_entry = math.degrees(math.atan2(-float(vz[local]), h))
+                residual.append((predicted_entry - float(entry[local])) / 2.0)
+            if np.isfinite(flight[local]):
+                residual.append((float(time_s[local]) - float(flight[local])) / 0.035)
 
-            target_x = float(lip_x[index]) if np.isfinite(lip_x[index]) else 0.0
-            target_y = float(lip_y[index]) if np.isfinite(lip_y[index]) else 0.0
-            residual.append((float(position[0]) - target_x) / 0.05)
-            residual.append((float(position[1]) - target_y) / 0.05)
-
-            horizontal = max(float(np.hypot(velocity[0], velocity[1])), 1e-9)
-            predicted_entry = math.degrees(math.atan2(-velocity[2], horizontal))
-            if np.isfinite(entry[index]):
-                residual.append((predicted_entry - float(entry[index])) / 3.0)
-            if np.isfinite(flight[index]):
-                residual.append((time_s - float(flight[index])) / 0.05)
+        # Weak priors stop correlated aerodynamic parameters from becoming an
+        # overfit explanation for measurement noise.
+        residual.extend(
+            [
+                (cd_ref - initial_aero.cd_reference) / 0.12,
+                (cd_slope - initial_aero.cd_log_re_slope) / 0.08,
+                (magnus - initial_aero.magnus_lift_slope) / 0.10,
+                (log_tau - math.log(max(initial_aero.spin_decay_tau_s, 0.2))) / 0.8,
+                angle_bias / 2.0,
+            ]
+        )
         return np.asarray(residual, dtype=float)
 
     fit = least_squares(
@@ -1391,25 +1799,27 @@ def fit_physics_from_logs(
                 initial_aero.cd_reference,
                 initial_aero.cd_log_re_slope,
                 initial_aero.magnus_lift_slope,
-                initial_aero.spin_decay_tau_s,
+                math.log(max(initial_aero.spin_decay_tau_s, 0.2)),
                 initial_aero.launch_angle_bias_deg,
             ],
             dtype=float,
         ),
         bounds=(
-            np.array([0.15, -0.15, 0.0, 0.20, -6.0]),
-            np.array([1.10, 0.20, 0.45, 20.0, 6.0]),
+            np.array([0.15, -0.15, 0.0, math.log(0.20), -6.0]),
+            np.array([1.10, 0.20, 0.45, math.log(20.0), 6.0]),
         ),
-        max_nfev=70,
+        loss="soft_l1",
+        f_scale=1.0,
+        max_nfev=80,
         verbose=0,
     )
-    cd_ref, cd_slope, magnus, tau, angle_bias = fit.x
+    cd_ref, cd_slope, magnus, log_tau, angle_bias = fit.x
     return replace(
         initial_aero,
         cd_reference=float(cd_ref),
         cd_log_re_slope=float(cd_slope),
         magnus_lift_slope=float(magnus),
-        spin_decay_tau_s=float(tau),
+        spin_decay_tau_s=float(math.exp(log_tau)),
         launch_angle_bias_deg=float(angle_bias),
     )
 
@@ -1479,45 +1889,67 @@ def fit_empirical_correction(
     distance = rows.column("distance_m")
     recommended = rows.column("recommended_rpm")
     rpm = rows.column("rpm")
+    angle = rows.column("angle_deg")
+    actual_angle = rows.column("actual_angle_deg")
     centered = _centered_row_mask(rows)
 
-    empirical_distance: list[float] = []
-    empirical_rpm: list[float] = []
+    observed_points: list[tuple[float, float, float]] = []
     for i in range(rows.count):
-        if np.isfinite(distance[i]) and np.isfinite(recommended[i]):
-            empirical_distance.append(float(distance[i]))
-            empirical_rpm.append(float(recommended[i]))
-        elif np.isfinite(distance[i]) and np.isfinite(rpm[i]) and centered[i]:
-            empirical_distance.append(float(distance[i]))
-            empirical_rpm.append(float(rpm[i]))
+        if not np.isfinite(distance[i]):
+            continue
+        # Empirical command correction is indexed by the commanded hood angle.
+        # Actual-angle deviations belong in shot noise, not in the lookup surface.
+        shot_angle = (
+            float(angle[i]) if np.isfinite(angle[i])
+            else float(actual_angle[i]) if np.isfinite(actual_angle[i])
+            else ROBOT_NOMINAL_LAUNCH_ANGLE_DEG
+        )
+        if np.isfinite(recommended[i]):
+            observed_points.append((float(distance[i]), shot_angle, float(recommended[i])))
+        elif np.isfinite(rpm[i]) and centered[i]:
+            observed_points.append((float(distance[i]), shot_angle, float(rpm[i])))
 
-    if len(empirical_distance) < 2:
+    if len(observed_points) < 2:
         return EmpiricalCorrection()
 
     robot = RobotState()
-    unique = np.unique(empirical_distance)
-    residual_x: list[float] = []
-    residual_y: list[float] = []
-    for d in unique:
-        observed = np.median([r for dd, r in zip(empirical_distance, empirical_rpm, strict=True) if math.isclose(dd, d, abs_tol=1e-9)])
-        baseline = nominal_center_rpm_for_angle(
-            float(d),
-            ROBOT_NOMINAL_LAUNCH_ANGLE_DEG,
-            rpm_bounds,
-            calibration,
-            ball,
-            aero,
-            hub,
-            shooter,
-            robot,
-        )
-        if baseline is not None:
-            residual_x.append(float(d))
-            residual_y.append(float(observed - baseline))
+    grouped: dict[tuple[float, float], list[float]] = {}
+    for d, a, observed_rpm in observed_points:
+        key = (round(d, 6), round(a, 4))
+        grouped.setdefault(key, []).append(observed_rpm)
 
-    if len(residual_x) < 2:
+    residual_d: list[float] = []
+    residual_a: list[float] = []
+    residual_rpm: list[float] = []
+    for (d, a), observed_values in sorted(grouped.items()):
+        baseline = nominal_center_rpm_for_angle(
+            float(d), float(a), rpm_bounds, calibration, ball, aero, hub, shooter, robot
+        )
+        if baseline is None:
+            continue
+        residual_d.append(float(d))
+        residual_a.append(float(a))
+        residual_rpm.append(float(np.median(observed_values) - baseline))
+
+    if len(residual_d) < 2:
         return EmpiricalCorrection()
-    return EmpiricalCorrection(tuple(residual_x), tuple(residual_y))
+
+    # PCHIP needs unique x in the single-angle case. Collapse duplicate distances.
+    if len(np.unique(residual_a)) < 2:
+        unique_d = np.unique(residual_d)
+        collapsed_y = [
+            float(np.median([r for dd, r in zip(residual_d, residual_rpm, strict=True) if math.isclose(dd, d, abs_tol=1e-9)]))
+            for d in unique_d
+        ]
+        if len(unique_d) < 2:
+            return EmpiricalCorrection()
+        return EmpiricalCorrection(
+            tuple(float(v) for v in unique_d),
+            tuple(collapsed_y),
+            tuple(float(residual_a[0]) for _ in unique_d),
+        )
+
+    return EmpiricalCorrection(tuple(residual_d), tuple(residual_rpm), tuple(residual_a))
 
 
 # ===========================================================================
@@ -1602,6 +2034,100 @@ def _numba_accel_spin(
 
 
 @njit(cache=True, fastmath=True)
+def _numba_contact_impulse(
+    vx: float, vy: float, vz: float,
+    wx: float, wy: float, wz: float,
+    nx: float, ny: float, nz: float,
+    mass: float, radius: float, restitution: float, friction: float,
+) -> tuple[float, float, float, float, float, float]:
+    norm = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if norm < 1e-12:
+        return vx, vy, vz, wx, wy, wz
+    nx /= norm; ny /= norm; nz /= norm
+    # r_contact = -radius*n, contact velocity = v + omega x r.
+    rx = -radius * nx; ry = -radius * ny; rz = -radius * nz
+    cvx = vx + wy * rz - wz * ry
+    cvy = vy + wz * rx - wx * rz
+    cvz = vz + wx * ry - wy * rx
+    vn = cvx * nx + cvy * ny + cvz * nz
+    if vn >= 0.0:
+        return vx, vy, vz, wx, wy, wz
+
+    jn_mag = -(1.0 + restitution) * mass * vn
+    jnx = jn_mag * nx; jny = jn_mag * ny; jnz = jn_mag * nz
+    vtx = cvx - vn * nx; vty = cvy - vn * ny; vtz = cvz - vn * nz
+    vtmag = math.sqrt(vtx * vtx + vty * vty + vtz * vtz)
+    jtx = 0.0; jty = 0.0; jtz = 0.0
+    if vtmag > 1e-12 and friction > 0.0:
+        m_eff = (2.0 / 7.0) * mass
+        jtx = -m_eff * vtx; jty = -m_eff * vty; jtz = -m_eff * vtz
+        jtmag = math.sqrt(jtx * jtx + jty * jty + jtz * jtz)
+        limit = friction * jn_mag
+        if jtmag > limit and jtmag > 1e-12:
+            scale = limit / jtmag
+            jtx *= scale; jty *= scale; jtz *= scale
+
+    jx = jnx + jtx; jy = jny + jty; jz = jnz + jtz
+    vx += jx / mass; vy += jy / mass; vz += jz / mass
+    inertia = (2.0 / 5.0) * mass * radius * radius
+    if inertia > 1e-12:
+        # torque impulse r x J_t
+        tx = ry * jtz - rz * jty
+        ty = rz * jtx - rx * jtz
+        tz = rx * jty - ry * jtx
+        wx += tx / inertia; wy += ty / inertia; wz += tz / inertia
+    return vx, vy, vz, wx, wy, wz
+
+
+@njit(cache=True, fastmath=True)
+def _numba_rk4_step(
+    x: float, y: float, z: float,
+    vx: float, vy: float, vz: float,
+    wx: float, wy: float, wz: float,
+    mass: float, diameter: float, cd_ref: float, cd_slope: float, ref_re: float,
+    magnus_slope: float, magnus_re_slope: float, max_cl: float, spin_tau: float,
+    wind_x: float, wind_y: float, wind_z: float, dt: float,
+) -> tuple[float, float, float, float, float, float, float, float, float]:
+    a1x,a1y,a1z,dw1x,dw1y,dw1z = _numba_accel_spin(
+        vx,vy,vz,wx,wy,wz,mass,diameter,cd_ref,cd_slope,ref_re,
+        magnus_slope,magnus_re_slope,max_cl,spin_tau,wind_x,wind_y,wind_z)
+    k1x=vx; k1y=vy; k1z=vz
+
+    v2x=vx+0.5*dt*a1x; v2y=vy+0.5*dt*a1y; v2z=vz+0.5*dt*a1z
+    w2x=wx+0.5*dt*dw1x; w2y=wy+0.5*dt*dw1y; w2z=wz+0.5*dt*dw1z
+    a2x,a2y,a2z,dw2x,dw2y,dw2z = _numba_accel_spin(
+        v2x,v2y,v2z,w2x,w2y,w2z,mass,diameter,cd_ref,cd_slope,ref_re,
+        magnus_slope,magnus_re_slope,max_cl,spin_tau,wind_x,wind_y,wind_z)
+    k2x=v2x; k2y=v2y; k2z=v2z
+
+    v3x=vx+0.5*dt*a2x; v3y=vy+0.5*dt*a2y; v3z=vz+0.5*dt*a2z
+    w3x=wx+0.5*dt*dw2x; w3y=wy+0.5*dt*dw2y; w3z=wz+0.5*dt*dw2z
+    a3x,a3y,a3z,dw3x,dw3y,dw3z = _numba_accel_spin(
+        v3x,v3y,v3z,w3x,w3y,w3z,mass,diameter,cd_ref,cd_slope,ref_re,
+        magnus_slope,magnus_re_slope,max_cl,spin_tau,wind_x,wind_y,wind_z)
+    k3x=v3x; k3y=v3y; k3z=v3z
+
+    v4x=vx+dt*a3x; v4y=vy+dt*a3y; v4z=vz+dt*a3z
+    w4x=wx+dt*dw3x; w4y=wy+dt*dw3y; w4z=wz+dt*dw3z
+    a4x,a4y,a4z,dw4x,dw4y,dw4z = _numba_accel_spin(
+        v4x,v4y,v4z,w4x,w4y,w4z,mass,diameter,cd_ref,cd_slope,ref_re,
+        magnus_slope,magnus_re_slope,max_cl,spin_tau,wind_x,wind_y,wind_z)
+    k4x=v4x; k4y=v4y; k4z=v4z
+
+    sixth=dt/6.0
+    x += sixth*(k1x+2.0*k2x+2.0*k3x+k4x)
+    y += sixth*(k1y+2.0*k2y+2.0*k3y+k4y)
+    z += sixth*(k1z+2.0*k2z+2.0*k3z+k4z)
+    vx += sixth*(a1x+2.0*a2x+2.0*a3x+a4x)
+    vy += sixth*(a1y+2.0*a2y+2.0*a3y+a4y)
+    vz += sixth*(a1z+2.0*a2z+2.0*a3z+a4z)
+    wx += sixth*(dw1x+2.0*dw2x+2.0*dw3x+dw4x)
+    wy += sixth*(dw1y+2.0*dw2y+2.0*dw3y+dw4y)
+    wz += sixth*(dw1z+2.0*dw2z+2.0*dw3z+dw4z)
+    return x,y,z,vx,vy,vz,wx,wy,wz
+
+
+@njit(cache=True, fastmath=True)
 def _numba_simulate_one(
     x: float,
     y: float,
@@ -1635,63 +2161,48 @@ def _numba_simulate_one(
     dt: float,
     max_time: float,
 ) -> tuple[int, int, float, float, float, float, float, float, float, float, int, int]:
-    """Return (score, class_code, margin, lip x/y, lip vx/vy/vz, time, peak, rim, funnel)."""
+    """Fast Monte Carlo trajectory using RK4 plus adaptive near-HUB substeps."""
     radius = 0.5 * diameter
     peak = z
-    previous_z = z
     time_s = 0.0
     crossed_lip = False
-    lip_x = math.nan
-    lip_y = math.nan
-    lip_vx = math.nan
-    lip_vy = math.nan
-    lip_vz = math.nan
-    lip_time = math.nan
-    lip_margin = -1e9
-    rim_contacts = 0
-    funnel_contacts = 0
-    initially_clean = False
-
+    lip_x = math.nan; lip_y = math.nan
+    lip_vx = math.nan; lip_vy = math.nan; lip_vz = math.nan
+    lip_time = math.nan; lip_margin = -1e9
+    rim_contacts = 0; funnel_contacts = 0; initially_clean = False
     funnel_bottom = lip_height - rim_thickness - funnel_depth
     rim_top = lip_height + 0.5 * rim_thickness
     rim_bottom = lip_height - 0.5 * rim_thickness
 
-    steps = int(max_time / dt) + 1
-    for _ in range(steps):
-        ax, ay, az, dwx, dwy, dwz = _numba_accel_spin(
-            vx, vy, vz, wx, wy, wz, mass, diameter, cd_ref, cd_slope, ref_re,
-            magnus_slope, magnus_re_slope, max_cl, spin_tau, wind_x, wind_y, wind_z
-        )
-        # RK2-ish velocity midpoint for position; acceleration evaluated once keeps
-        # JIT kernel compact and is accurate enough at 2-3 ms steps.
-        vx_mid = vx + 0.5 * dt * ax
-        vy_mid = vy + 0.5 * dt * ay
-        vz_mid = vz + 0.5 * dt * az
-        old_x = x
-        old_y = y
-        old_z = z
-        x += dt * vx_mid
-        y += dt * vy_mid
-        z += dt * vz_mid
-        vx += dt * ax
-        vy += dt * ay
-        vz += dt * az
-        wx += dt * dwx
-        wy += dt * dwy
-        wz += dt * dwz
-        time_s += dt
-        if z > peak:
-            peak = z
+    while time_s < max_time:
+        # Smaller steps near the score boundary/contact region. This keeps the fast
+        # optimizer numerically consistent with the accurate nominal solver.
+        step = dt
+        dz = abs(z - lip_height)
+        if crossed_lip or dz < 0.25:
+            step = min(step, 0.0005)
+        elif dz < 0.55:
+            step = min(step, 0.0015)
+        if time_s + step > max_time:
+            step = max_time - time_s
+
+        old_x=x; old_y=y; old_z=z
+        old_vx=vx; old_vy=vy; old_vz=vz
+        x,y,z,vx,vy,vz,wx,wy,wz = _numba_rk4_step(
+            x,y,z,vx,vy,vz,wx,wy,wz,mass,diameter,cd_ref,cd_slope,ref_re,
+            magnus_slope,magnus_re_slope,max_cl,spin_tau,wind_x,wind_y,wind_z,step)
+        time_s += step
+        if z > peak: peak = z
 
         if not crossed_lip and old_z >= lip_height and z < lip_height and vz < 0.0:
             denom = old_z - z
             frac = 0.0 if abs(denom) < 1e-12 else (old_z - lip_height) / denom
             lip_x = old_x + frac * (x - old_x)
             lip_y = old_y + frac * (y - old_y)
-            lip_vx = vx
-            lip_vy = vy
-            lip_vz = vz
-            lip_time = time_s - dt + frac * dt
+            lip_vx = old_vx + frac * (vx - old_vx)
+            lip_vy = old_vy + frac * (vy - old_vy)
+            lip_vz = old_vz + frac * (vz - old_vz)
+            lip_time = time_s - step + frac * step
             proj, _ = _numba_hex_max_projection(lip_x, lip_y)
             lip_margin = opening_apothem - proj - radius
             initially_clean = lip_margin >= 0.0
@@ -1700,24 +2211,21 @@ def _numba_simulate_one(
         if crossed_lip:
             proj, normal_index = _numba_hex_max_projection(x, y)
             angle = normal_index * math.pi / 3.0
-            nx = math.cos(angle)
-            ny = math.sin(angle)
+            nx = math.cos(angle); ny = math.sin(angle)
             inner = opening_apothem - radius
             outer = opening_apothem + rim_width + radius
             overlaps_z = (z - radius <= rim_top) and (z + radius >= rim_bottom)
             in_annulus = proj > inner and proj < outer
             if overlaps_z and in_annulus and vz < 0.0:
                 rim_contacts += 1
-                z = rim_top + radius + 1e-5
-                vz = -restitution * vz
-                vx *= max(0.0, 1.0 - friction)
-                vy *= max(0.0, 1.0 - friction)
-                if proj < opening_apothem + 0.5 * rim_width:
-                    inward = 0.25 * abs(vz)
-                    vx -= inward * nx
-                    vy -= inward * ny
+                z = rim_top + radius + 1e-6
+                vx,vy,vz,wx,wy,wz = _numba_contact_impulse(
+                    vx,vy,vz,wx,wy,wz,0.0,0.0,1.0,mass,radius,restitution,friction)
+                if proj < opening_apothem + 0.35 * rim_width:
+                    vx,vy,vz,wx,wy,wz = _numba_contact_impulse(
+                        vx,vy,vz,wx,wy,wz,-nx,-ny,0.35,mass,radius,
+                        0.5*restitution,0.7*friction)
 
-            # Funnel wall collision.
             if z <= lip_height and z >= funnel_bottom:
                 top_z = lip_height - rim_thickness
                 if z >= top_z:
@@ -1732,54 +2240,38 @@ def _numba_simulate_one(
                 if proj > allowed:
                     funnel_contacts += 1
                     angle = normal_index * math.pi / 3.0
-                    nx = math.cos(angle)
-                    ny = math.sin(angle)
+                    nx = math.cos(angle); ny = math.sin(angle)
                     penetration = proj - allowed
-                    x -= penetration * nx
-                    y -= penetration * ny
+                    x -= penetration * nx; y -= penetration * ny
                     da_dz = (opening_apothem - throat_apothem) / max(funnel_depth, 1e-9)
-                    onx = nx
-                    ony = ny
-                    onz = -da_dz
-                    norm = math.sqrt(onx * onx + ony * ony + onz * onz)
-                    onx /= norm
-                    ony /= norm
-                    onz /= norm
-                    vn = vx * onx + vy * ony + vz * onz
-                    if vn > 0.0:
-                        tx = vx - vn * onx
-                        ty = vy - vn * ony
-                        tz = vz - vn * onz
-                        vx = (1.0 - friction) * tx - restitution * vn * onx
-                        vy = (1.0 - friction) * ty - restitution * vn * ony
-                        vz = (1.0 - friction) * tz - restitution * vn * onz
+                    # gradient is outward/invalid; negate it to point into free space.
+                    vx,vy,vz,wx,wy,wz = _numba_contact_impulse(
+                        vx,vy,vz,wx,wy,wz,-nx,-ny,da_dz,mass,radius,restitution,friction)
 
             if z <= funnel_bottom - radius:
                 proj, _ = _numba_hex_max_projection(x, y)
-                if proj <= throat_apothem - 0.15 * radius and vz < 0.0:
+                if proj <= throat_apothem - 0.10 * radius and vz < 0.0:
                     if initially_clean and rim_contacts == 0 and funnel_contacts == 0:
-                        class_code = 1  # clean
+                        class_code = 1
                     elif rim_contacts > 0 and funnel_contacts > 0:
-                        class_code = 4  # rim+funnel
+                        class_code = 4
                     elif rim_contacts > 0:
-                        class_code = 2  # rim
+                        class_code = 2
                     else:
-                        class_code = 3  # funnel
-                    return 1, class_code, lip_margin, lip_x, lip_y, lip_vx, lip_vy, lip_vz, lip_time, peak, rim_contacts, funnel_contacts
-                return 0, 0, lip_margin, lip_x, lip_y, lip_vx, lip_vy, lip_vz, lip_time, peak, rim_contacts, funnel_contacts
+                        class_code = 3
+                    return 1,class_code,lip_margin,lip_x,lip_y,lip_vx,lip_vy,lip_vz,lip_time,peak,rim_contacts,funnel_contacts
+                return 0,0,lip_margin,lip_x,lip_y,lip_vx,lip_vy,lip_vz,lip_time,peak,rim_contacts,funnel_contacts
 
             if z > lip_height + 0.35 and vz > 0.0:
-                return 0, 0, lip_margin, lip_x, lip_y, lip_vx, lip_vy, lip_vz, lip_time, peak, rim_contacts, funnel_contacts
+                return 0,0,lip_margin,lip_x,lip_y,lip_vx,lip_vy,lip_vz,lip_time,peak,rim_contacts,funnel_contacts
             proj, _ = _numba_hex_max_projection(x, y)
             if proj > opening_apothem + rim_width + 0.50:
-                return 0, 0, lip_margin, lip_x, lip_y, lip_vx, lip_vy, lip_vz, lip_time, peak, rim_contacts, funnel_contacts
+                return 0,0,lip_margin,lip_x,lip_y,lip_vx,lip_vy,lip_vz,lip_time,peak,rim_contacts,funnel_contacts
 
         if z <= radius and vz < 0.0:
-            return 0, 0, lip_margin, lip_x, lip_y, lip_vx, lip_vy, lip_vz, lip_time, peak, rim_contacts, funnel_contacts
+            return 0,0,lip_margin,lip_x,lip_y,lip_vx,lip_vy,lip_vz,lip_time,peak,rim_contacts,funnel_contacts
 
-        previous_z = z
-
-    return 0, 0, lip_margin, lip_x, lip_y, lip_vx, lip_vy, lip_vz, lip_time, peak, rim_contacts, funnel_contacts
+    return 0,0,lip_margin,lip_x,lip_y,lip_vx,lip_vy,lip_vz,lip_time,peak,rim_contacts,funnel_contacts
 
 
 @njit(cache=True, fastmath=True)
@@ -1908,8 +2400,9 @@ def monte_carlo_candidates(
     include_model = mode in ("combined", "model")
     include_shot = mode in ("combined", "shot")
 
-    # Common random numbers across candidates reduce ranking noise.
-    model_z = sobol_standard_normals(n, 6, seed + 11)
+    # Common random numbers across candidates reduce ranking noise. Eleven model
+    # dimensions include real FUEL size/mass variation and spin magnitude/axis.
+    model_z = sobol_standard_normals(n, 11, seed + 11)
     shot_error = correlated_shot_errors(n, shot_distribution, seed + 29)
     if not include_shot:
         shot_error[:] = 0.0
@@ -1922,25 +2415,45 @@ def monte_carlo_candidates(
         return np.tile(array[:, col], candidate_count)
 
     mass = np.full(total, ball.mass_kg, dtype=float)
+    diameter = np.full(total, ball.diameter_m, dtype=float)
     cd_ref = np.full(total, aero.cd_reference, dtype=float)
     cd_slope = np.full(total, aero.cd_log_re_slope, dtype=float)
     magnus = np.full(total, aero.magnus_lift_slope, dtype=float)
     spin_tau = np.full(total, aero.spin_decay_tau_s, dtype=float)
     speed_scale = np.ones(total, dtype=float)
+    spin_model_scale = np.ones(total, dtype=float)
+    tilt_horizontal_deg = np.zeros(total, dtype=float)
+    tilt_vertical_deg = np.zeros(total, dtype=float)
+    spin_scatter_z = np.zeros(total, dtype=float)
+
     if include_model:
         mass += uncertainty.mass_sigma_kg * tile_col(model_z, 0)
-        mass = np.clip(mass, 0.195, 0.235)
-        cd_ref += uncertainty.cd_reference_sigma * tile_col(model_z, 1)
+        mass = np.clip(mass, FUEL_MASS_MIN_KG, FUEL_MASS_MAX_KG)
+        diameter += uncertainty.diameter_sigma_m * tile_col(model_z, 1)
+        diameter = np.clip(diameter, 0.94 * ball.diameter_m, 1.06 * ball.diameter_m)
+        cd_ref += uncertainty.cd_reference_sigma * tile_col(model_z, 2)
         cd_ref = np.clip(cd_ref, 0.15, 1.1)
-        cd_slope += uncertainty.cd_log_re_slope_sigma * tile_col(model_z, 2)
-        magnus += uncertainty.magnus_slope_sigma * tile_col(model_z, 3)
+        cd_slope += uncertainty.cd_log_re_slope_sigma * tile_col(model_z, 3)
+        magnus += uncertainty.magnus_slope_sigma * tile_col(model_z, 4)
         magnus = np.clip(magnus, 0.0, 0.45)
-        spin_tau *= np.maximum(0.2, 1.0 + uncertainty.spin_decay_fraction_sigma * tile_col(model_z, 4))
-        speed_scale *= np.maximum(0.5, 1.0 + uncertainty.calibration_speed_scale_sigma * tile_col(model_z, 5))
+        spin_tau *= np.maximum(0.2, 1.0 + uncertainty.spin_decay_fraction_sigma * tile_col(model_z, 5))
+        speed_scale *= np.maximum(0.5, 1.0 + uncertainty.calibration_speed_scale_sigma * tile_col(model_z, 6))
+        spin_model_scale *= np.maximum(0.3, 1.0 + uncertainty.spin_scale_sigma * tile_col(model_z, 7))
+        tilt_horizontal_deg = uncertainty.spin_axis_tilt_sigma_deg * tile_col(model_z, 8)
+        tilt_vertical_deg = uncertainty.spin_axis_tilt_sigma_deg * tile_col(model_z, 9)
+        spin_scatter_z = tile_col(model_z, 10)
 
     error = np.tile(shot_error, (candidate_count, 1))
     actual_rpm = rpm_command + error[:, 0]
+
+    # Preserve correlations learned for launch-speed residuals while making their
+    # marginal sigma depend on RPM when repeated speed measurements are available.
+    if include_shot:
+        global_speed_sigma = math.sqrt(max(float(shot_distribution.covariance()[1, 1]), 1e-12))
+        conditional_speed_sigma = calibration.speed_sigma_fraction_from_rpm(actual_rpm)
+        error[:, 1] *= conditional_speed_sigma / global_speed_sigma
     speed_scale *= np.maximum(0.5, 1.0 + error[:, 1])
+
     actual_angle = angle_command + aero.launch_angle_bias_deg + error[:, 2]
     yaw_error = error[:, 3]
     actual_distance = distance_m + error[:, 4]
@@ -1952,24 +2465,11 @@ def monte_carlo_candidates(
 
     launch_speed = calibration.speed_from_rpm(actual_rpm) * speed_scale
     launch_speed = np.maximum(0.2, launch_speed)
-    spin_rpm = calibration.spin_from_rpm(actual_rpm)
-
-    # Refined lead is too expensive per MC sample.  Solve exact lead once per
-    # candidate at nominal conditions, then inject measured yaw error around it.
-    # Candidate sweeps use the inexpensive kinematic lead.  The final selected
-    # nominal shot is re-solved with the exact trajectory-root lead, so this avoids
-    # dozens of nested solve_ivp calls without removing exact lead compensation
-    # from the delivered setpoint/diagnostics.
-    nominal_yaw = np.array(
-        [
-            first_order_lead_yaw_deg(
-                distance_m, float(rpm), float(angle), calibration, aero, shooter, robot
-            )
-            for rpm, angle in zip(rpms, angles, strict=True)
-        ],
-        dtype=float,
-    )
-    yaw = np.repeat(nominal_yaw, n) + yaw_error
+    nominal_spin_rpm = calibration.spin_from_rpm(actual_rpm)
+    conditional_spin_sigma = calibration.spin_sigma_fraction_from_rpm(actual_rpm)
+    spin_rpm = nominal_spin_rpm * spin_model_scale
+    if include_model:
+        spin_rpm *= np.maximum(0.2, 1.0 + conditional_spin_sigma * spin_scatter_z)
 
     position0 = np.column_stack(
         (
@@ -1979,26 +2479,44 @@ def monte_carlo_candidates(
         )
     )
 
-    angle_rad = np.deg2rad(actual_angle)
-    yaw_rad = np.deg2rad(yaw)
-    horizontal = np.cos(angle_rad)
-    units = np.column_stack(
-        (horizontal * np.cos(yaw_rad), horizontal * np.sin(yaw_rad), np.sin(angle_rad))
-    )
-
     rotational_vx = -robot_omega * shooter.left_offset_m
     rotational_vy = robot_omega * shooter.forward_offset_m
     robot_exit_v = np.column_stack(
         (robot_vx + rotational_vx, robot_vy + rotational_vy, np.zeros(total))
     )
+
+    # Per-sample moving-shot lead. Unlike the previous implementation this uses
+    # each sample's perturbed distance, RPM/launch speed and robot velocity.
+    target_xy = -position0[:, :2]
+    target_len = np.maximum(np.linalg.norm(target_xy, axis=1), 1e-9)
+    target_unit = target_xy / target_len[:, None]
+    target_yaw = np.arctan2(target_unit[:, 1], target_unit[:, 0])
+    perp = np.column_stack((-target_unit[:, 1], target_unit[:, 0]))
+    v_perp = np.sum(robot_exit_v[:, :2] * perp, axis=1)
+    horizontal_speed = np.maximum(
+        launch_speed * np.cos(np.deg2rad(actual_angle)), 1e-6
+    )
+    lead_delta = np.arcsin(np.clip(-v_perp / horizontal_speed, -0.98, 0.98))
+    yaw_rad = target_yaw + lead_delta + np.deg2rad(yaw_error)
+
+    angle_rad = np.deg2rad(actual_angle)
+    horizontal = np.cos(angle_rad)
+    units = np.column_stack(
+        (horizontal * np.cos(yaw_rad), horizontal * np.sin(yaw_rad), np.sin(angle_rad))
+    )
     velocity0 = launch_speed[:, None] * units + robot_exit_v
 
-    # Full 3-D spin vector.  Backspin axis follows each perturbed yaw; logs can
-    # later provide explicit spin_xyz columns for a more specialized extension.
-    spin_axis = np.column_stack((np.sin(yaw_rad), -np.cos(yaw_rad), np.zeros(total)))
+    # Full 3-D spin vector with shot/model axis tilt rather than ideal backspin only.
+    ideal_spin_axis = np.column_stack((np.sin(yaw_rad), -np.cos(yaw_rad), np.zeros(total)))
+    launch_horizontal_axis = np.column_stack((np.cos(yaw_rad), np.sin(yaw_rad), np.zeros(total)))
+    spin_axis = (
+        ideal_spin_axis
+        + np.tan(np.deg2rad(tilt_horizontal_deg))[:, None] * launch_horizontal_axis
+        + np.tan(np.deg2rad(tilt_vertical_deg))[:, None] * np.array([0.0, 0.0, 1.0])
+    )
+    spin_axis /= np.maximum(np.linalg.norm(spin_axis, axis=1), 1e-12)[:, None]
     spin0 = spin_axis * (spin_rpm * 2.0 * math.pi / 60.0)[:, None]
 
-    diameter = np.full(total, ball.diameter_m, dtype=float)
     wind = np.tile(
         np.array([aero.wind_x_mps, aero.wind_y_mps, aero.wind_z_mps], dtype=float),
         (total, 1),
@@ -2030,12 +2548,27 @@ def monte_carlo_candidates(
         3.0,
     )
     score, class_code, margin = result[0], result[1], result[2]
+    lip_vx, lip_vy, lip_vz = result[5], result[6], result[7]
     score = score.reshape(candidate_count, n)
     class_code = class_code.reshape(candidate_count, n)
     margin = margin.reshape(candidate_count, n)
+    lip_vx = lip_vx.reshape(candidate_count, n)
+    lip_vy = lip_vy.reshape(candidate_count, n)
+    lip_vz = lip_vz.reshape(candidate_count, n)
     finite_margin = np.where(np.isfinite(margin), margin, -1.0)
 
-    probability = np.mean(score, axis=1)
+    # When enough real rim/score data exists, blend the rigid contact result with
+    # an empirical P(score | lip margin, entry angle) model. This captures foam/rim
+    # behavior that a rigid-body approximation cannot fully reproduce.
+    horizontal_at_lip = np.maximum(np.hypot(lip_vx, lip_vy), 1e-9)
+    entry_angle_mc = np.degrees(np.arctan2(-lip_vz, horizontal_at_lip))
+    empirical_probability = shot_distribution.empirical_score_probability(margin, entry_angle_mc)
+    if empirical_probability is not None:
+        blend = min(0.85, max(0.50, shot_distribution.score_model_rows / 200.0))
+        sample_probability = (1.0 - blend) * score.astype(float) + blend * empirical_probability
+        probability = np.mean(sample_probability, axis=1)
+    else:
+        probability = np.mean(score, axis=1)
     clean_probability = np.mean(class_code == 1, axis=1)
     rim_probability = np.mean((class_code == 2) | (class_code == 4), axis=1)
     funnel_probability = np.mean((class_code == 3) | (class_code == 4), axis=1)
@@ -2214,10 +2747,10 @@ def optimize_shot_for_distance(
     probability_threshold: float,
     seed: int,
 ) -> OptimizedShot:
-    correction_rpm = float(correction.correction_rpm(distance_m))
+    correction_rpm = float(correction.correction_rpm(distance_m, ROBOT_NOMINAL_LAUNCH_ANGLE_DEG))
 
-    # Preserve the trusted default anchor exactly when 70 degrees is an allowed
-    # candidate and no measured exit-speed curve has replaced it.
+    # Preserve the original trusted fallback anchor exactly until real measured
+    # RPM->exit-speed calibration replaces it.
     if (
         calibration.uses_fallback_anchor
         and abs(distance_m - CALIBRATION_DISTANCE_M) < 1e-9
@@ -2226,65 +2759,23 @@ def optimize_shot_for_distance(
         best_angle = ROBOT_NOMINAL_LAUNCH_ANGLE_DEG
         best_rpm = CALIBRATION_RPM
         final_stats = monte_carlo_candidates(
-            distance_m,
-            np.array([best_rpm]),
-            np.array([best_angle]),
-            max(final_samples, adaptive_max_samples),
-            calibration,
-            ball,
-            aero,
-            hub,
-            shooter,
-            robot,
-            uncertainty,
-            shot_distribution,
-            "combined",
-            seed,
+            distance_m, np.array([best_rpm]), np.array([best_angle]),
+            max(final_samples, adaptive_max_samples), calibration, ball, aero, hub,
+            shooter, robot, uncertainty, shot_distribution, "combined", seed,
         )
         model_stats = monte_carlo_candidates(
-            distance_m,
-            np.array([best_rpm]),
-            np.array([best_angle]),
-            final_samples,
-            calibration,
-            ball,
-            aero,
-            hub,
-            shooter,
-            robot,
-            uncertainty,
-            shot_distribution,
-            "model",
-            seed + 2,
+            distance_m, np.array([best_rpm]), np.array([best_angle]), final_samples,
+            calibration, ball, aero, hub, shooter, robot, uncertainty,
+            shot_distribution, "model", seed + 2,
         )
         shot_stats = monte_carlo_candidates(
-            distance_m,
-            np.array([best_rpm]),
-            np.array([best_angle]),
-            final_samples,
-            calibration,
-            ball,
-            aero,
-            hub,
-            shooter,
-            robot,
-            uncertainty,
-            shot_distribution,
-            "shot",
-            seed + 3,
+            distance_m, np.array([best_rpm]), np.array([best_angle]), final_samples,
+            calibration, ball, aero, hub, shooter, robot, uncertainty,
+            shot_distribution, "shot", seed + 3,
         )
         nominal = simulate_shot(
-            distance_m,
-            best_rpm,
-            best_angle,
-            calibration,
-            ball,
-            aero,
-            hub,
-            shooter,
-            robot,
-            exact_lead=True,
-            save_trajectory=True,
+            distance_m, best_rpm, best_angle, calibration, ball, aero, hub, shooter,
+            robot, exact_lead=True, save_trajectory=True,
         )
         p = float(final_stats.probability[0])
         return OptimizedShot(
@@ -2302,30 +2793,36 @@ def optimize_shot_for_distance(
             nominal=nominal,
         )
 
-    center_rpms: list[float] = []
-    valid_angles: list[float] = []
+    # ------------------------------------------------------------------
+    # Stage 1: genuine 2-D coarse search. For every angle, search a band of RPMs
+    # around the deterministic center solution rather than evaluating only one RPM.
+    # ------------------------------------------------------------------
+    coarse_rpm: list[float] = []
+    coarse_angle: list[float] = []
+    offsets = np.arange(-200.0, 200.1, 50.0)
     for angle in angle_candidates_deg:
         center = nominal_center_rpm_for_angle(
-            distance_m,
-            float(angle),
-            rpm_bounds,
-            calibration,
-            ball,
-            aero,
-            hub,
-            shooter,
-            robot,
+            distance_m, float(angle), rpm_bounds, calibration, ball, aero, hub, shooter, robot
         )
-        if center is not None and np.isfinite(center):
-            center_rpms.append(float(np.clip(center + correction_rpm, *rpm_bounds)))
-            valid_angles.append(float(angle))
-    if not center_rpms:
+        if center is None or not np.isfinite(center):
+            continue
+        angle_correction = float(correction.correction_rpm(distance_m, float(angle)))
+        center = float(center + angle_correction)
+        for offset in offsets:
+            rpm = float(np.clip(center + offset, *rpm_bounds))
+            rpm = float(_round_rpm(rpm))
+            rpm = float(np.clip(rpm, *rpm_bounds))
+            coarse_rpm.append(rpm)
+            coarse_angle.append(float(angle))
+
+    if not coarse_rpm:
         raise ValueError(f"No valid descending shot at {distance_m:.2f} m")
 
-    angle_stats = adaptive_candidate_statistics(
+    coarse_pairs = np.unique(np.column_stack((coarse_rpm, coarse_angle)), axis=0)
+    coarse_stats = adaptive_candidate_statistics(
         distance_m,
-        np.asarray(center_rpms),
-        np.asarray(valid_angles),
+        coarse_pairs[:, 0],
+        coarse_pairs[:, 1],
         optimizer_samples,
         adaptive_max_samples,
         calibration,
@@ -2339,30 +2836,39 @@ def optimize_shot_for_distance(
         "combined",
         seed,
     )
-    angle_index = choose_best_candidate(
-        angle_stats,
-        distance_m,
-        calibration,
-        ball,
-        aero,
-        hub,
-        shooter,
-        robot,
+    coarse_index = choose_best_candidate(
+        coarse_stats, distance_m, calibration, ball, aero, hub, shooter, robot
     )
-    best_angle = float(angle_stats.angle_deg[angle_index])
-    preferred_rpm = float(angle_stats.rpm[angle_index])
+    coarse_best_rpm = float(coarse_stats.rpm[coarse_index])
+    coarse_best_angle = float(coarse_stats.angle_deg[coarse_index])
 
-    step = ROUND_TO_RPM
-    low = max(rpm_bounds[0], preferred_rpm - 250.0)
-    high = min(rpm_bounds[1], preferred_rpm + 250.0)
-    rpms = np.arange(math.floor(low / step) * step, math.ceil(high / step) * step + 0.1, step)
-    rpms = rpms[(rpms >= rpm_bounds[0]) & (rpms <= rpm_bounds[1])]
-    angles = np.full_like(rpms, best_angle)
+    # ------------------------------------------------------------------
+    # Stage 2: local 2-D refinement. The previous implementation locked angle
+    # before refining RPM, which could miss a more robust angle/RPM combination.
+    # ------------------------------------------------------------------
+    if len(angle_candidates_deg) > 1:
+        unique_angles = np.sort(np.unique(angle_candidates_deg))
+        coarse_angle_step = float(np.min(np.diff(unique_angles)))
+        fine_angle_step = max(0.25, 0.5 * coarse_angle_step)
+        angle_low = max(float(np.min(unique_angles)), coarse_best_angle - coarse_angle_step)
+        angle_high = min(float(np.max(unique_angles)), coarse_best_angle + coarse_angle_step)
+        fine_angles = np.arange(angle_low, angle_high + 0.5 * fine_angle_step, fine_angle_step)
+    else:
+        fine_angles = np.array([coarse_best_angle])
 
-    rpm_stats = adaptive_candidate_statistics(
+    fine_rpms = np.arange(
+        max(rpm_bounds[0], coarse_best_rpm - 125.0),
+        min(rpm_bounds[1], coarse_best_rpm + 125.0) + 0.1,
+        ROUND_TO_RPM,
+    )
+    mesh_rpm, mesh_angle = np.meshgrid(fine_rpms, fine_angles, indexing="xy")
+    refine_rpm = mesh_rpm.ravel()
+    refine_angle = mesh_angle.ravel()
+
+    refine_stats = adaptive_candidate_statistics(
         distance_m,
-        rpms,
-        angles,
+        refine_rpm,
+        refine_angle,
         final_samples,
         adaptive_max_samples,
         calibration,
@@ -2376,8 +2882,8 @@ def optimize_shot_for_distance(
         "combined",
         seed + 101,
     )
-    rpm_index = choose_best_candidate(
-        rpm_stats,
+    refine_index = choose_best_candidate(
+        refine_stats,
         distance_m,
         calibration,
         ball,
@@ -2385,72 +2891,79 @@ def optimize_shot_for_distance(
         hub,
         shooter,
         robot,
-        preferred_rpm=preferred_rpm,
+        preferred_rpm=coarse_best_rpm,
     )
-    best_rpm = float(rpm_stats.rpm[rpm_index])
+    best_rpm = float(refine_stats.rpm[refine_index])
+    best_angle = float(refine_stats.angle_deg[refine_index])
 
-    acceptable = rpm_stats.probability >= probability_threshold
+    # Final one-dimensional RPM sweep at the selected angle gives a meaningful
+    # probability band and permits the final RPM to move if the high-sample sweep
+    # discovers a better nearby quantized command.
+    band_rpms = np.arange(
+        max(rpm_bounds[0], best_rpm - 250.0),
+        min(rpm_bounds[1], best_rpm + 250.0) + 0.1,
+        ROUND_TO_RPM,
+    )
+    band_angles = np.full_like(band_rpms, best_angle)
+    band_stats = adaptive_candidate_statistics(
+        distance_m,
+        band_rpms,
+        band_angles,
+        final_samples,
+        adaptive_max_samples,
+        calibration,
+        ball,
+        aero,
+        hub,
+        shooter,
+        robot,
+        uncertainty,
+        shot_distribution,
+        "combined",
+        seed + 151,
+    )
+    band_best = choose_best_candidate(
+        band_stats, distance_m, calibration, ball, aero, hub, shooter, robot,
+        preferred_rpm=best_rpm,
+    )
+    best_rpm = float(band_stats.rpm[band_best])
+    final_combined = float(band_stats.probability[band_best])
+    final_clean = float(band_stats.clean_probability[band_best])
+    final_contact = float(band_stats.rim_probability[band_best] + band_stats.funnel_probability[band_best])
+
+    acceptable = band_stats.probability >= probability_threshold
     if np.any(acceptable):
-        band_low = float(np.min(rpm_stats.rpm[acceptable]))
-        band_high = float(np.max(rpm_stats.rpm[acceptable]))
+        band_low = float(np.min(band_stats.rpm[acceptable]))
+        band_high = float(np.max(band_stats.rpm[acceptable]))
     else:
         band_low = band_high = float("nan")
 
+    correction_rpm = float(correction.correction_rpm(distance_m, best_angle))
+
     model_stats = monte_carlo_candidates(
-        distance_m,
-        np.array([best_rpm]),
-        np.array([best_angle]),
-        final_samples,
-        calibration,
-        ball,
-        aero,
-        hub,
-        shooter,
-        robot,
-        uncertainty,
-        shot_distribution,
-        "model",
-        seed + 201,
+        distance_m, np.array([best_rpm]), np.array([best_angle]), final_samples,
+        calibration, ball, aero, hub, shooter, robot, uncertainty,
+        shot_distribution, "model", seed + 201,
     )
     shot_stats = monte_carlo_candidates(
-        distance_m,
-        np.array([best_rpm]),
-        np.array([best_angle]),
-        final_samples,
-        calibration,
-        ball,
-        aero,
-        hub,
-        shooter,
-        robot,
-        uncertainty,
-        shot_distribution,
-        "shot",
-        seed + 301,
+        distance_m, np.array([best_rpm]), np.array([best_angle]), final_samples,
+        calibration, ball, aero, hub, shooter, robot, uncertainty,
+        shot_distribution, "shot", seed + 301,
     )
     nominal = simulate_shot(
-        distance_m,
-        best_rpm,
-        best_angle,
-        calibration,
-        ball,
-        aero,
-        hub,
-        shooter,
-        robot,
-        exact_lead=True,
-        save_trajectory=True,
+        distance_m, best_rpm, best_angle, calibration, ball, aero, hub, shooter,
+        robot, exact_lead=True, save_trajectory=True,
     )
     return OptimizedShot(
         distance_m=distance_m,
         rpm=best_rpm,
         angle_deg=best_angle,
         learned_correction_rpm=correction_rpm,
-        combined_probability=float(rpm_stats.probability[rpm_index]),
+        combined_probability=final_combined,
         model_only_probability=float(model_stats.probability[0]),
         shot_only_probability=float(shot_stats.probability[0]),
-        clean_probability=float(rpm_stats.clean_probability[rpm_index]),
-        contact_probability=float(rpm_stats.rim_probability[rpm_index] + rpm_stats.funnel_probability[rpm_index]),
+        clean_probability=final_clean,
+        contact_probability=final_contact,
         probability_band_low_rpm=band_low,
         probability_band_high_rpm=band_high,
         nominal=nominal,
@@ -2569,6 +3082,7 @@ def optimize_distances_parallel(
     executor_kind: str,
     seed: int,
     show_progress: bool,
+    on_result: Callable[[OptimizedShot], None] | None = None,
 ) -> list[OptimizedShot]:
     payloads = [
         OptimizeWorkerPayload(
@@ -2597,7 +3111,12 @@ def optimize_distances_parallel(
         iterator: Iterable[OptimizeWorkerPayload] = payloads
         if show_progress:
             iterator = tqdm(payloads, desc="Optimizing shots", unit="distance")
-        results = [_optimize_worker(payload) for payload in iterator]
+        results: list[OptimizedShot] = []
+        for payload in iterator:
+            shot = _optimize_worker(payload)
+            results.append(shot)
+            if on_result is not None:
+                on_result(shot)
         return sorted(results, key=lambda shot: shot.distance_m)
 
     executor_cls = _executor_class(executor_kind)
@@ -2608,7 +3127,10 @@ def optimize_distances_parallel(
         if show_progress:
             iterator = tqdm(iterator, total=len(payloads), desc="Optimizing shots", unit="distance")
         for future in iterator:
-            results.append(future.result())
+            shot = future.result()
+            results.append(shot)
+            if on_result is not None:
+                on_result(shot)
     return sorted(results, key=lambda shot: shot.distance_m)
 
 
@@ -2696,28 +3218,84 @@ def write_dense_lookup(
     output_directory: Path,
     shots: Sequence[OptimizedShot],
     step_m: float,
+    validation_samples: int,
+    calibration: ShooterCalibration,
+    ball: BallModel,
+    aero: AeroModel,
+    hub: HubGeometry,
+    shooter: ShooterGeometry,
+    robot: RobotState,
+    uncertainty: UncertaintyModel,
+    shot_distribution: ShotErrorDistribution,
+    seed: int,
+    show_progress: bool = True,
 ) -> Path:
+    """Write a dense lookup validated at the exact command the robot will use.
+
+    RPM/angle are interpolated as control proposals, then RPM is quantized and every
+    dense row is re-simulated. Probability is never interpolated from sparse points.
+    """
     distances = np.asarray([shot.distance_m for shot in shots], dtype=float)
     rpms = np.asarray([shot.rpm for shot in shots], dtype=float)
     angles = np.asarray([shot.angle_deg for shot in shots], dtype=float)
-    probabilities = np.asarray([shot.combined_probability for shot in shots], dtype=float)
     dense = np.arange(distances[0], distances[-1] + 0.5 * step_m, step_m)
-    dense_rpm = _monotonic_dense_curve(distances, rpms, dense)
-    dense_angle = _monotonic_dense_curve(distances, angles, dense)
-    dense_probability = _monotonic_dense_curve(distances, probabilities, dense)
+    proposed_rpm = _monotonic_dense_curve(distances, rpms, dense)
+    proposed_angle = _monotonic_dense_curve(distances, angles, dense)
+    commanded_rpm = _round_rpm(proposed_rpm)
+
+    # Vectorized candidate evaluation: each dense distance is different, so evaluate
+    # by distance in a short loop. The expensive trajectories remain JIT compiled.
+    probability = np.zeros(len(dense), dtype=float)
+    clean_probability = np.zeros(len(dense), dtype=float)
+    iterator: Iterable[int] = range(len(dense))
+    if show_progress and len(dense) > 10:
+        iterator = tqdm(iterator, total=len(dense), desc="Validating dense lookup", unit="row")
+    for idx in iterator:
+        stats = monte_carlo_candidates(
+            float(dense[idx]),
+            np.array([float(commanded_rpm[idx])]),
+            np.array([float(proposed_angle[idx])]),
+            validation_samples,
+            calibration,
+            ball,
+            aero,
+            hub,
+            shooter,
+            robot,
+            uncertainty,
+            shot_distribution,
+            "combined",
+            seed + 4099 * idx,
+        )
+        probability[idx] = float(stats.probability[0])
+        clean_probability[idx] = float(stats.clean_probability[0])
 
     path = output_directory / "shooter_lookup_dense.csv"
     with path.open("w", newline="", encoding="utf-8") as output_file:
         writer = csv.writer(output_file)
-        writer.writerow(["distance_m", "flywheel_rpm", "rounded_rpm", "hood_angle_deg", "interpolated_score_probability"])
-        for d, rpm, angle, probability in zip(dense, dense_rpm, dense_angle, dense_probability, strict=True):
+        writer.writerow(
+            [
+                "distance_m",
+                "interpolated_flywheel_rpm",
+                "commanded_rounded_rpm",
+                "hood_angle_deg",
+                "validated_score_probability",
+                "validated_clean_probability",
+                "validation_samples",
+            ]
+        )
+        for d, proposed, command, angle, p_score, p_clean in zip(
+            dense, proposed_rpm, commanded_rpm, proposed_angle, probability, clean_probability, strict=True
+        ):
             writer.writerow(
                 [
                     f"{d:.3f}",
-                    f"{rpm:.3f}",
-                    f"{float(_round_rpm(rpm)):.1f}",
+                    f"{proposed:.3f}",
+                    f"{float(command):.1f}",
                     f"{angle:.4f}",
-                    f"{float(np.clip(probability, 0.0, 1.0)):.6f}",
+                    f"{p_score:.6f}",
+                    f"{p_clean:.6f}",
+                    int(validation_samples),
                 ]
             )
     return path
@@ -2888,14 +3466,25 @@ def write_calibration_plot(output_directory: Path, rows: CalibrationRows, calibr
 def write_shot_log_template(output_directory: Path) -> Path:
     path = output_directory / "shot_log_template.csv"
     headers = [
+        "timestamp",
+        "session_id",
+        "ball_id",
         "distance_m",
         "rpm",
         "angle_deg",
         "exit_speed_mps",
         "spin_rpm",
+        "spin_x_rpm",
+        "spin_y_rpm",
+        "spin_z_rpm",
         "result",
+        "scored",
         "recommended_rpm",
         "actual_rpm",
+        "rpm_before_shot",
+        "rpm_min_during_shot",
+        "rpm_after_shot",
+        "time_since_previous_shot_s",
         "actual_angle_deg",
         "yaw_error_deg",
         "entry_angle_deg",
@@ -2908,6 +3497,8 @@ def write_shot_log_template(output_directory: Path) -> Path:
         "robot_vx_error_mps",
         "robot_vy_error_mps",
         "robot_omega_error_deg_s",
+        "battery_voltage",
+        "notes",
     ]
     if not path.exists():
         with path.open("w", newline="", encoding="utf-8") as output_file:
@@ -2928,12 +3519,15 @@ def write_calibration_report(
         output_file.write(f"Calibration source: {calibration.source}\n")
         output_file.write(f"1400 flywheel RPM speed: {float(calibration.speed_from_rpm(1400.0)):.6f} m/s\n")
         output_file.write(f"Spin source: {calibration.spin_curve.source if calibration.spin_curve else 'fallback spin ratio'}\n")
+        output_file.write(f"Speed scatter source: {calibration.speed_sigma_fraction_curve.source if calibration.speed_sigma_fraction_curve else 'fallback constant'}\n")
+        output_file.write(f"Spin scatter source: {calibration.spin_sigma_fraction_curve.source if calibration.spin_sigma_fraction_curve else 'fallback constant'}\n")
         output_file.write(f"Cd reference: {aero.cd_reference:.6f}\n")
         output_file.write(f"Cd log-Re slope: {aero.cd_log_re_slope:.6f}\n")
         output_file.write(f"Magnus slope: {aero.magnus_lift_slope:.6f}\n")
         output_file.write(f"Spin decay tau: {aero.spin_decay_tau_s:.6f} s\n")
         output_file.write(f"Launch-angle bias: {aero.launch_angle_bias_deg:+.6f} deg\n")
         output_file.write(f"Shot covariance learned rows: {shot_distribution.source_rows}\n")
+        output_file.write(f"Empirical score/contact model rows: {shot_distribution.score_model_rows}\n")
         output_file.write(f"Empirical correction points: {len(correction.x)}\n")
         output_file.write("\nShot-error covariance order:\n")
         for index, name in enumerate(SHOT_ERROR_NAMES):
@@ -2952,6 +3546,272 @@ def print_java_entries(shots: Sequence[OptimizedShot]) -> None:
     for shot in shots:
         print(f"HOOD_ANGLE_DEG_BY_DISTANCE.put({shot.distance_m:.2f}, {shot.angle_deg:.3f});")
 
+
+
+# ===========================================================================
+# HELD-OUT VALIDATION + 3-D VISUALIZATION
+# ===========================================================================
+
+
+def _result_to_binary_score(text: str, explicit: float) -> float:
+    if np.isfinite(explicit):
+        return 1.0 if explicit >= 0.5 else 0.0
+    label = text.strip().lower()
+    if not label:
+        return float("nan")
+    if any(token in label for token in ("miss", "fail", "no_score", "noscore")):
+        return 0.0
+    if any(token in label for token in ("score", "center", "good", "bullseye", "made")):
+        return 1.0
+    return float("nan")
+
+
+def write_validation_report(
+    output_directory: Path,
+    rows: CalibrationRows,
+    calibration: ShooterCalibration,
+    ball: BallModel,
+    aero: AeroModel,
+    hub: HubGeometry,
+    shooter: ShooterGeometry,
+    uncertainty: UncertaintyModel,
+    shot_distribution: ShotErrorDistribution,
+    samples: int,
+    seed: int,
+) -> Path | None:
+    if rows.count == 0:
+        return None
+    distance = rows.column("distance_m")
+    rpm = rows.column("rpm")
+    actual_rpm = rows.column("actual_rpm")
+    angle = rows.column("actual_angle_deg")
+    command_angle = rows.column("angle_deg")
+    lip_x = rows.column("lip_x_m")
+    lip_y = rows.column("lip_y_m")
+    entry = rows.column("entry_angle_deg")
+    flight = rows.column("flight_time_s")
+    explicit_scored = rows.column("scored")
+    labels = rows.text_column("result")
+
+    errors_x: list[float] = []
+    errors_y: list[float] = []
+    errors_entry: list[float] = []
+    errors_flight: list[float] = []
+    predicted_p: list[float] = []
+    observed_y: list[float] = []
+    prediction_rows: list[list[object]] = []
+    robot = RobotState()
+
+    for idx in range(rows.count):
+        if not (np.isfinite(distance[idx]) and np.isfinite(rpm[idx])):
+            continue
+        use_rpm = float(actual_rpm[idx]) if np.isfinite(actual_rpm[idx]) else float(rpm[idx])
+        use_angle = (
+            float(angle[idx]) if np.isfinite(angle[idx])
+            else float(command_angle[idx]) if np.isfinite(command_angle[idx])
+            else ROBOT_NOMINAL_LAUNCH_ANGLE_DEG
+        )
+        try:
+            nominal = simulate_shot(
+                float(distance[idx]), use_rpm, use_angle, calibration, ball, aero,
+                hub, shooter, robot, exact_lead=True, save_trajectory=False,
+            )
+        except (ValueError, RuntimeError):
+            continue
+        if nominal.reached_hub:
+            if np.isfinite(lip_x[idx]): errors_x.append(float(nominal.position_at_lip_m[0] - lip_x[idx]))
+            if np.isfinite(lip_y[idx]): errors_y.append(float(nominal.position_at_lip_m[1] - lip_y[idx]))
+            if np.isfinite(entry[idx]): errors_entry.append(float(nominal.entry_angle_deg - entry[idx]))
+            if np.isfinite(flight[idx]): errors_flight.append(float(nominal.flight_time_s - flight[idx]))
+
+        stats = monte_carlo_candidates(
+            float(distance[idx]), np.array([float(rpm[idx])]), np.array([use_angle]), samples,
+            calibration, ball, aero, hub, shooter, robot, uncertainty, shot_distribution,
+            "combined", seed + idx * 7919,
+        )
+        p_score = float(stats.probability[0])
+        y_score = _result_to_binary_score(labels[idx], explicit_scored[idx])
+        if np.isfinite(y_score):
+            predicted_p.append(p_score)
+            observed_y.append(y_score)
+        prediction_rows.append([
+            idx, float(distance[idx]), float(rpm[idx]), use_rpm, use_angle,
+            p_score, y_score, nominal.classification,
+        ])
+
+    def mae(values: list[float]) -> float:
+        return float(np.mean(np.abs(values))) if values else float("nan")
+
+    brier = float("nan")
+    log_loss = float("nan")
+    if predicted_p:
+        pp = np.clip(np.asarray(predicted_p), 1e-6, 1.0 - 1e-6)
+        yy = np.asarray(observed_y)
+        brier = float(np.mean((pp - yy) ** 2))
+        log_loss = float(-np.mean(yy * np.log(pp) + (1.0 - yy) * np.log(1.0 - pp)))
+
+    reliability_rows: list[tuple[float, float, int]] = []
+    if predicted_p:
+        pp = np.asarray(predicted_p, dtype=float)
+        yy = np.asarray(observed_y, dtype=float)
+        edges = np.linspace(0.0, 1.0, 11)
+        for b in range(10):
+            if b == 9:
+                mask = (pp >= edges[b]) & (pp <= edges[b + 1])
+            else:
+                mask = (pp >= edges[b]) & (pp < edges[b + 1])
+            if np.any(mask):
+                reliability_rows.append((float(np.mean(pp[mask])), float(np.mean(yy[mask])), int(np.count_nonzero(mask))))
+        if reliability_rows:
+            figure, axis = plt.subplots(figsize=(6.4, 5.4), layout="constrained")
+            axis.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", label="Perfect calibration")
+            axis.plot(
+                [r[0] for r in reliability_rows],
+                [r[1] for r in reliability_rows],
+                "o-",
+                label="Held-out shots",
+            )
+            axis.set(
+                title="Held-out score-probability reliability",
+                xlabel="Predicted P(score)",
+                ylabel="Observed score fraction",
+                xlim=(0.0, 1.0),
+                ylim=(0.0, 1.0),
+            )
+            axis.grid(alpha=0.3)
+            axis.legend()
+            figure.savefig(output_directory / "validation_reliability.png", dpi=180)
+            plt.close(figure)
+
+    report = output_directory / "held_out_validation.txt"
+    with report.open("w", encoding="utf-8") as f:
+        f.write("HELD-OUT SHOOTER MODEL VALIDATION\n")
+        f.write("=================================\n")
+        f.write(f"Rows supplied: {rows.count}\n")
+        f.write(f"Lip X MAE: {mae(errors_x):.5f} m (n={len(errors_x)})\n")
+        f.write(f"Lip Y MAE: {mae(errors_y):.5f} m (n={len(errors_y)})\n")
+        f.write(f"Entry-angle MAE: {mae(errors_entry):.3f} deg (n={len(errors_entry)})\n")
+        f.write(f"Flight-time MAE: {mae(errors_flight):.5f} s (n={len(errors_flight)})\n")
+        f.write(f"Brier score: {brier:.6f} (n={len(predicted_p)})\n")
+        f.write(f"Log loss: {log_loss:.6f} (n={len(predicted_p)})\n")
+        if reliability_rows:
+            f.write("\nProbability reliability bins (mean predicted -> actual, n):\n")
+            for mean_pred, actual, count in reliability_rows:
+                f.write(f"  {mean_pred:.3f} -> {actual:.3f}, n={count}\n")
+        f.write("Validation data is never used to fit the calibration/physics model.\n")
+
+    csv_path = output_directory / "held_out_validation_predictions.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "row", "distance_m", "command_rpm", "actual_or_command_rpm", "angle_deg",
+            "predicted_score_probability", "observed_score", "nominal_classification",
+        ])
+        writer.writerows(prediction_rows)
+    return report
+
+
+def write_3d_trajectory_archive(output_directory: Path, shots: Sequence[OptimizedShot]) -> Path:
+    payload: dict[str, np.ndarray] = {
+        "distance_m": np.asarray([s.distance_m for s in shots], dtype=float),
+        "rpm": np.asarray([s.rpm for s in shots], dtype=float),
+        "angle_deg": np.asarray([s.angle_deg for s in shots], dtype=float),
+    }
+    for i, shot in enumerate(shots):
+        payload[f"path_{i}"] = (
+            np.asarray(shot.nominal.full_path_m, dtype=float)
+            if shot.nominal.full_path_m is not None else np.empty((0, 3), dtype=float)
+        )
+        payload[f"time_{i}"] = (
+            np.asarray(shot.nominal.full_path_t_s, dtype=float)
+            if shot.nominal.full_path_t_s is not None else np.empty((0,), dtype=float)
+        )
+    path = output_directory / "shooter_trajectories_3d.npz"
+    np.savez_compressed(path, **payload)
+    return path
+
+
+class Live3DShotViewer:
+    """Matplotlib 3-D viewer using the exact nominal path including HUB contacts."""
+
+    def __init__(self, hub: HubGeometry, ball: BallModel, fps: float = 60.0, time_scale: float = 1.0):
+        self.hub = hub
+        self.ball = ball
+        self.fps = max(float(fps), 5.0)
+        self.time_scale = max(float(time_scale), 0.05)
+        self.enabled = True
+        try:
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+            self._Poly3DCollection = Poly3DCollection
+            plt.ion()
+            self.figure = plt.figure(figsize=(10.5, 7.2), layout="constrained")
+            self.axis = self.figure.add_subplot(111, projection="3d")
+            self.axis.set_xlabel("x toward HUB (m)")
+            self.axis.set_ylabel("y left (m)")
+            self.axis.set_zlabel("height (m)")
+            self.axis.set_zlim(0.0, max(3.0, hub.lip_height_m + 1.0))
+            self.axis.set_ylim(-1.2, 1.2)
+            self._draw_hub()
+            self.path_line, = self.axis.plot([], [], [], linewidth=2.0, label="trajectory")
+            self.ball_marker = self.axis.scatter([], [], [], s=130, depthshade=True, label="FUEL")
+            self.axis.legend(loc="upper left")
+            self.figure.canvas.draw_idle()
+            plt.pause(0.001)
+        except Exception as exc:
+            self.enabled = False
+            warnings.warn(f"Could not start interactive 3-D viewer: {exc}")
+
+    def _hex_vertices(self, apothem: float, z: float) -> np.ndarray:
+        radius = apothem / math.cos(math.pi / 6.0)
+        angles = np.deg2rad(np.arange(30.0, 390.0, 60.0))
+        return np.column_stack((radius * np.cos(angles), radius * np.sin(angles), np.full(6, z)))
+
+    def _draw_hub(self) -> None:
+        top = self._hex_vertices(self.hub.opening_apothem_m, self.hub.lip_height_m)
+        bottom = self._hex_vertices(self.hub.throat_apothem_m, self.hub.funnel_bottom_z_m)
+        loop_top = np.vstack((top, top[0]))
+        loop_bottom = np.vstack((bottom, bottom[0]))
+        self.axis.plot(loop_top[:,0], loop_top[:,1], loop_top[:,2], linewidth=2.5, label="HUB opening")
+        self.axis.plot(loop_bottom[:,0], loop_bottom[:,1], loop_bottom[:,2], linestyle="--", linewidth=1.5)
+        faces = []
+        for i in range(6):
+            j = (i + 1) % 6
+            faces.append([top[i], top[j], bottom[j], bottom[i]])
+        poly = self._Poly3DCollection(faces, alpha=0.12, linewidth=0.7)
+        self.axis.add_collection3d(poly)
+        self.axis.plot([-0.65,0.65,0.65,-0.65,-0.65],[-0.65,-0.65,0.65,0.65,-0.65],[0,0,0,0,0], alpha=0.35)
+
+    def play_shot(self, shot: OptimizedShot) -> None:
+        if not self.enabled:
+            return
+        path = shot.nominal.full_path_m
+        times = shot.nominal.full_path_t_s
+        if path is None or len(path) < 2:
+            return
+        path = np.asarray(path, dtype=float)
+        times = np.asarray(times, dtype=float) if times is not None else np.linspace(0, 1, len(path))
+        self.axis.set_xlim(min(-0.5, float(np.min(path[:,0])) - 0.3), 0.8)
+        self.axis.set_title(
+            f"{shot.distance_m:.2f} m  |  {shot.rpm:.0f} RPM @ {shot.angle_deg:.2f}°  |  {shot.nominal.classification}"
+        )
+        self.path_line.set_data([], [])
+        self.path_line.set_3d_properties([])
+        max_frames = max(2, int(self.fps * max(times[-1] - times[0], 0.1) / self.time_scale))
+        indices = np.unique(np.linspace(0, len(path)-1, max_frames).astype(int))
+        for idx in indices:
+            segment = path[:idx+1]
+            self.path_line.set_data(segment[:,0], segment[:,1])
+            self.path_line.set_3d_properties(segment[:,2])
+            self.ball_marker._offsets3d = ([path[idx,0]], [path[idx,1]], [path[idx,2]])
+            self.figure.canvas.draw_idle()
+            plt.pause(1.0 / self.fps)
+        plt.pause(0.10)
+
+    def hold(self) -> None:
+        if not self.enabled:
+            return
+        plt.ioff()
+        plt.show()
 
 
 # ===========================================================================
@@ -2980,18 +3840,21 @@ def parse_distances(value: str) -> np.ndarray:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--samples", type=int, default=128, help="Base final MC samples per candidate")
-    parser.add_argument("--optimizer-samples", type=int, default=64, help="Base MC samples while selecting angle")
-    parser.add_argument("--adaptive-max-samples", type=int, default=512, help="Sobol samples for competitive candidates")
-    parser.add_argument("--heatmap-samples", type=int, default=64, help="Samples per heatmap cell")
+    parser.add_argument("--samples", type=int, default=256, help="Base final MC samples per candidate")
+    parser.add_argument("--optimizer-samples", type=int, default=96, help="Base MC samples in coarse 2-D search")
+    parser.add_argument("--adaptive-max-samples", type=int, default=1024, help="Sobol samples for competitive candidates")
+    parser.add_argument("--heatmap-samples", type=int, default=96, help="Samples per heatmap cell")
+    parser.add_argument("--dense-validation-samples", type=int, default=128, help="MC samples used to validate each dense rounded lookup row")
+    parser.add_argument("--validation-samples", type=int, default=256, help="MC samples per held-out validation row")
     parser.add_argument("--probability-threshold", type=float, default=0.80)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--executor", choices=("process", "thread"), default="thread", help="thread is usually fastest with the Numba kernel; process is available for isolation")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--output-directory", type=Path, default=Path(__file__).resolve().parent / "output")
-    parser.add_argument("--calibration-csv", type=Path, default=None)
-    parser.add_argument("--auto-calibrate", action="store_true", help="Fit physics and shot covariance from supplied logs")
+    parser.add_argument("--calibration-csv", type=Path, default=None, help="Training/calibration shot log")
+    parser.add_argument("--validation-csv", type=Path, default=None, help="Held-out shot log; never used for fitting")
+    parser.add_argument("--auto-calibrate", action="store_true", help="Fit regularized physics and shot covariance from training logs")
     parser.add_argument("--distances", type=parse_distances, default=DISTANCES_M, help='"1:6:0.5" or comma list')
     parser.add_argument("--rpm-min", type=float, default=800.0)
     parser.add_argument("--rpm-max", type=float, default=3000.0)
@@ -3015,14 +3878,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wind-y", type=float, default=0.0)
     parser.add_argument("--wind-z", type=float, default=0.0)
 
+    # Internal HUB/contact defaults are approximations unless replaced from team
+    # CAD/measurements. The official top opening and 72in height remain fixed above.
+    parser.add_argument("--hub-rim-width", type=float, default=HUB_RIM_RADIAL_WIDTH_M)
+    parser.add_argument("--hub-rim-thickness", type=float, default=HUB_RIM_THICKNESS_M)
+    parser.add_argument("--hub-funnel-depth", type=float, default=HUB_FUNNEL_DEPTH_M)
+    parser.add_argument("--hub-throat-flat-to-flat", type=float, default=HUB_FUNNEL_THROAT_FLAT_TO_FLAT_M)
+    parser.add_argument("--hub-restitution", type=float, default=HUB_CONTACT_RESTITUTION)
+    parser.add_argument("--hub-friction", type=float, default=HUB_CONTACT_FRICTION)
+
+    parser.add_argument("--live-3d", action="store_true", help="Animate each optimized shot as soon as its calculation completes")
+    parser.add_argument("--show-3d", action="store_true", help="Replay all optimized shots in the 3-D viewer after calculation", default=True)
+    parser.add_argument("--3d-fps", type=float, default=60.0, dest="viewer_fps")
+    parser.add_argument("--3d-time-scale", type=float, default=1.0, dest="viewer_time_scale", help="1=real time, 0.5=half-speed, 2=double-speed")
+    parser.add_argument("--no-3d-hold", action="store_true", help="Do not block on the 3-D window after the run")
     return parser
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.samples < 16 or args.optimizer_samples < 16 or args.heatmap_samples < 8:
         parser.error("Monte Carlo sample counts are too small")
-    if args.adaptive_max_samples < args.samples:
-        parser.error("--adaptive-max-samples must be >= --samples")
+    if args.dense_validation_samples < 16 or args.validation_samples < 16:
+        parser.error("validation sample counts must be at least 16")
+    if args.adaptive_max_samples < max(args.samples, args.optimizer_samples):
+        parser.error("--adaptive-max-samples must be >= both --samples and --optimizer-samples")
     if args.rpm_max <= args.rpm_min:
         parser.error("--rpm-max must be greater than --rpm-min")
     if not (0.0 < args.probability_threshold <= 1.0):
@@ -3033,6 +3912,14 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("use either --optimize-angle or --fixed-angle")
     if args.dense_step <= 0.0 or args.heatmap_rpm_step <= 0.0:
         parser.error("lookup/heatmap steps must be positive")
+    if args.viewer_fps <= 0.0 or args.viewer_time_scale <= 0.0:
+        parser.error("3-D FPS and time scale must be positive")
+    if min(args.hub_rim_width, args.hub_rim_thickness, args.hub_funnel_depth, args.hub_throat_flat_to_flat) <= 0.0:
+        parser.error("HUB geometry dimensions must be positive")
+    if not (0.0 <= args.hub_restitution <= 1.0):
+        parser.error("--hub-restitution must be in [0,1]")
+    if not (0.0 <= args.hub_friction <= 2.0):
+        parser.error("--hub-friction must be in [0,2]")
 
 
 def main() -> None:
@@ -3047,7 +3934,14 @@ def main() -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
 
     ball = BallModel()
-    hub = HubGeometry()
+    hub = HubGeometry(
+        rim_radial_width_m=float(args.hub_rim_width),
+        rim_thickness_m=float(args.hub_rim_thickness),
+        funnel_depth_m=float(args.hub_funnel_depth),
+        throat_flat_to_flat_m=float(args.hub_throat_flat_to_flat),
+        restitution=float(args.hub_restitution),
+        friction=float(args.hub_friction),
+    )
     shooter = ShooterGeometry(
         exit_height_m=float(args.exit_height),
         forward_offset_m=float(args.shooter_forward_offset),
@@ -3064,17 +3958,19 @@ def main() -> None:
         wind_z_mps=float(args.wind_z),
     )
     uncertainty = UncertaintyModel()
+
+    # Training and validation are deliberately separate. The validation CSV is
+    # never passed to any fitter, preventing optimistic in-sample accuracy reports.
     rows = load_calibration_rows(args.calibration_csv)
+    validation_rows = load_calibration_rows(args.validation_csv)
     calibration = build_calibration(rows, ball, aero, hub, shooter)
 
     if args.auto_calibrate and rows.count > 0:
         aero = fit_physics_from_logs(rows, calibration, ball, aero, hub, shooter)
-        # Keep fallback anchor exact after the physics fit if there was no measured
-        # speed curve; measured calibration deliberately remains authoritative.
         if calibration.speed_curve is None:
             calibration = build_calibration(rows, ball, aero, hub, shooter)
 
-    shot_distribution = estimate_shot_error_distribution(rows, calibration, uncertainty)
+    shot_distribution = estimate_shot_error_distribution(rows, calibration, uncertainty, hub, ball)
     rpm_bounds = (float(args.rpm_min), float(args.rpm_max))
     correction = fit_empirical_correction(rows, rpm_bounds, calibration, ball, aero, hub, shooter)
 
@@ -3089,36 +3985,34 @@ def main() -> None:
 
     distances = np.asarray(args.distances, dtype=float)
 
-    # Warm the Numba cache in the parent so fork/spawn workers are less surprising.
+    # Warm the Numba cache in the parent so worker startup is predictable.
     if NUMBA_AVAILABLE:
         dummy = np.array([[0.0, 0.0, shooter.exit_height_m]])
         dummy_v = np.array([[1.0, 0.0, 3.0]])
         dummy_s = np.array([[0.0, -10.0, 0.0]])
         _numba_batch_kernel(
-            dummy,
-            dummy_v,
-            dummy_s,
-            np.array([ball.mass_kg]),
-            np.array([ball.diameter_m]),
-            np.array([aero.cd_reference]),
-            np.array([aero.cd_log_re_slope]),
-            aero.reference_reynolds,
-            np.array([aero.magnus_lift_slope]),
-            aero.magnus_re_slope,
-            aero.max_cl,
-            np.array([aero.spin_decay_tau_s]),
-            np.zeros((1, 3)),
-            hub.opening_apothem_m,
-            hub.lip_height_m,
-            hub.rim_radial_width_m,
-            hub.rim_thickness_m,
-            hub.funnel_depth_m,
-            hub.throat_apothem_m,
-            hub.restitution,
-            hub.friction,
-            0.003,
-            0.01,
+            dummy, dummy_v, dummy_s,
+            np.array([ball.mass_kg]), np.array([ball.diameter_m]),
+            np.array([aero.cd_reference]), np.array([aero.cd_log_re_slope]),
+            aero.reference_reynolds, np.array([aero.magnus_lift_slope]),
+            aero.magnus_re_slope, aero.max_cl, np.array([aero.spin_decay_tau_s]),
+            np.zeros((1, 3)), hub.opening_apothem_m, hub.lip_height_m,
+            hub.rim_radial_width_m, hub.rim_thickness_m, hub.funnel_depth_m,
+            hub.throat_apothem_m, hub.restitution, hub.friction, 0.003, 0.01,
         )
+
+    viewer: Live3DShotViewer | None = None
+    if args.live_3d:
+        viewer = Live3DShotViewer(hub, ball, fps=args.viewer_fps, time_scale=args.viewer_time_scale)
+
+    def on_shot(shot: OptimizedShot) -> None:
+        print(
+            f"{shot.distance_m:4.2f} m -> {shot.rpm:6.0f} RPM @ {shot.angle_deg:5.2f} deg | "
+            f"P(score)={shot.combined_probability:6.1%} | clean={shot.clean_probability:6.1%} | "
+            f"entry={shot.nominal.entry_angle_deg:5.1f} deg | {shot.nominal.classification}"
+        )
+        if viewer is not None:
+            viewer.play_shot(shot)
 
     shots = optimize_distances_parallel(
         distances,
@@ -3141,22 +4035,36 @@ def main() -> None:
         str(args.executor),
         int(args.seed),
         not bool(args.no_progress),
+        on_result=on_shot if args.live_3d else None,
     )
 
-    for shot in shots:
-        print(
-            f"{shot.distance_m:4.2f} m -> {shot.rpm:6.0f} RPM @ {shot.angle_deg:5.1f} deg | "
-            f"P(score)={shot.combined_probability:6.1%} | clean={shot.clean_probability:6.1%} | "
-            f"entry={shot.nominal.entry_angle_deg:5.1f} deg | {shot.nominal.classification}"
-        )
+    # If live mode was not requested, print in sorted distance order now.
+    if not args.live_3d:
+        for shot in shots:
+            print(
+                f"{shot.distance_m:4.2f} m -> {shot.rpm:6.0f} RPM @ {shot.angle_deg:5.2f} deg | "
+                f"P(score)={shot.combined_probability:6.1%} | clean={shot.clean_probability:6.1%} | "
+                f"entry={shot.nominal.entry_angle_deg:5.1f} deg | {shot.nominal.classification}"
+            )
 
     write_lookup_csv(output_directory, shots)
-    write_dense_lookup(output_directory, shots, float(args.dense_step))
+    write_dense_lookup(
+        output_directory, shots, float(args.dense_step), int(args.dense_validation_samples),
+        calibration, ball, aero, hub, shooter, robot, uncertainty, shot_distribution,
+        int(args.seed) + 500001,
+        not bool(args.no_progress),
+    )
     write_rpm_plot(output_directory, shots)
     write_trajectory_plot(output_directory, shots, hub)
+    write_3d_trajectory_archive(output_directory, shots)
     write_shot_log_template(output_directory)
     write_calibration_plot(output_directory, rows, calibration)
     write_calibration_report(output_directory, calibration, aero, shot_distribution, correction)
+    if validation_rows.count > 0:
+        write_validation_report(
+            output_directory, validation_rows, calibration, ball, aero, hub, shooter,
+            uncertainty, shot_distribution, int(args.validation_samples), int(args.seed) + 700001,
+        )
 
     rpm_grid = np.arange(
         math.ceil(rpm_bounds[0] / args.heatmap_rpm_step) * args.heatmap_rpm_step,
@@ -3183,6 +4091,13 @@ def main() -> None:
         not bool(args.no_progress),
     )
 
+    if args.show_3d and not args.live_3d:
+        viewer = Live3DShotViewer(hub, ball, fps=args.viewer_fps, time_scale=args.viewer_time_scale)
+        for shot in shots:
+            viewer.play_shot(shot)
+
+    if viewer is not None and not args.no_3d_hold:
+        viewer.hold()
 
     print_java_entries(shots)
     print("\nModel summary:")
@@ -3191,13 +4106,16 @@ def main() -> None:
     print(f"  Nominal launch angle: {ROBOT_NOMINAL_LAUNCH_ANGLE_DEG:.1f} deg")
     print(f"  Calibration: {calibration.source}")
     print(f"  1400 RPM -> {float(calibration.speed_from_rpm(CALIBRATION_RPM)):.3f} m/s")
+    print(f"  Official FUEL mass envelope used in MC: {FUEL_MASS_MIN_KG:.3f}-{FUEL_MASS_MAX_KG:.3f} kg")
     print(f"  Cd(reference): {aero.cd_reference:.4f}")
     print(f"  Cd log-Re slope: {aero.cd_log_re_slope:+.4f}")
     print(f"  Magnus slope: {aero.magnus_lift_slope:.4f}")
     print(f"  Spin decay tau: {aero.spin_decay_tau_s:.3f} s")
     print(f"  Launch-angle bias: {aero.launch_angle_bias_deg:+.3f} deg")
     print(f"  Learned shot-covariance rows: {shot_distribution.source_rows}")
+    print(f"  Empirical score/contact rows: {shot_distribution.score_model_rows}")
     print(f"  Empirical RPM correction points: {len(correction.x)}")
+    print(f"  Held-out validation rows: {validation_rows.count}")
     print(f"  Numba JIT: {'enabled' if NUMBA_AVAILABLE else 'NOT AVAILABLE'}")
     print(f"  Outputs: {output_directory}")
 
