@@ -324,21 +324,29 @@ public class Drive extends SubsystemBase {
   }
 
   public Command hubCommand() {
-    return run(
-        () -> {
+    return shotAimCommand();
+  }
+
+  /** Turns the rear-facing shooter toward its current hub or alliance-side return target. */
+  public Command shotAimCommand() {
+    return run(() -> {
           Pose2d currentPose = getPose();
-          Translation2d hubPosition = getAllianceHubPosition();
+          ShotTargeting.Target shotTarget = getShotTarget();
+          Translation2d targetPosition = shotTarget.position();
           Rotation2d targetHeading =
-              HubAiming.headingToTarget(currentPose.getTranslation(), hubPosition)
+              HubAiming.headingToTarget(currentPose.getTranslation(), targetPosition)
                   .rotateBy(new Rotation2d(Math.PI));
           double turnSpeed =
               headingController.calculate(
                   currentPose.getRotation().getRadians(), targetHeading.getRadians());
 
-          Logger.recordOutput("Drive/HubAim/Target", hubPosition);
-          Logger.recordOutput("Drive/HubAim/TargetHeading", targetHeading);
+          Logger.recordOutput("Drive/ShotAim/Target", targetPosition);
+          Logger.recordOutput("Drive/ShotAim/TargetHeading", targetHeading);
+          Logger.recordOutput(
+              "Drive/ShotAim/ReturningToAllianceSide", shotTarget.returnsToAllianceSide());
           runVelocity(new ChassisSpeeds(0.0, 0.0, turnSpeed));
-        });
+        })
+        .withName("Aim Shooter");
   }
 
   /** Returns the center of the scoring hub belonging to the current alliance. */
@@ -349,5 +357,20 @@ public class Drive extends SubsystemBase {
   /** Returns this robot's current planar distance from the center of its alliance hub. */
   public double getDistanceToAllianceHub() {
     return getPose().getTranslation().getDistance(getAllianceHubPosition());
+  }
+
+  /** Returns the active shot target, mirrored for alliance and midfield position. */
+  private ShotTargeting.Target getShotTarget() {
+    return ShotTargeting.targetFor(getPose(), DriverStation.getAlliance().orElse(Alliance.Blue));
+  }
+
+  /** Returns the planar distance to the active hub or alliance-side floor landing target. */
+  public double getDistanceToShotTarget() {
+    return getPose().getTranslation().getDistance(getShotTarget().position());
+  }
+
+  /** True when midfield shots should return FUEL to the floor on this robot's alliance side. */
+  public boolean isReturningFuelToAllianceSide() {
+    return getShotTarget().returnsToAllianceSide();
   }
 }

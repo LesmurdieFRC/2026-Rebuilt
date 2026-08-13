@@ -26,4 +26,11 @@ class ShooterTest {
     assertEquals(1400.0, Shooter.flywheelSpeedForDistance(Double.NaN));
     assertEquals(1400.0, Shooter.flywheelSpeedForDistance(Double.POSITIVE_INFINITY));
   }
+
+  @Test
+  void interpolatesFloorLandingModel() {
+    assertEquals(1257.0, Shooter.floorLandingSpeedForDistance(2.25));
+    assertEquals(510.0, Shooter.floorLandingSpeedForDistance(0.0));
+    assertEquals(2991.0, Shooter.floorLandingSpeedForDistance(10.0));
+  }
 }

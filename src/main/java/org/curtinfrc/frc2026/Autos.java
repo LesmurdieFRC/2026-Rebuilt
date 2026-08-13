@@ -54,14 +54,29 @@ public final class Autos {
     factory
         .bind("Start Intake", shooter.intake())
         .bind("Stop Intake", shooter.stopOnce())
-        .bind("Shoot", shooter.shootBurst(drive::getDistanceToAllianceHub, 3))
+        .bind(
+            "Shoot",
+            shooter.shootBurst(
+                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3))
         // Keep the existing lowercase marker names usable in previously-authored paths.
         .bind("intake", shooter.intake())
         .bind("stop", shooter.stopOnce())
-        .bind("shoot", shooter.shootBurst(drive::getDistanceToAllianceHub, 3))
-        .bind("score", shooter.shootBurst(drive::getDistanceToAllianceHub, 1))
-        .bind("shoot2", shooter.shootBurst(drive::getDistanceToAllianceHub, 2))
-        .bind("shoot3", shooter.shootBurst(drive::getDistanceToAllianceHub, 3));
+        .bind(
+            "shoot",
+            shooter.shootBurst(
+                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3))
+        .bind(
+            "score",
+            shooter.shootBurst(
+                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 1))
+        .bind(
+            "shoot2",
+            shooter.shootBurst(
+                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 2))
+        .bind(
+            "shoot3",
+            shooter.shootBurst(
+                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3));
   }
 
   private static List<String> findDeployedTrajectories() {

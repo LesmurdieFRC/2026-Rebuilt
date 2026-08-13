@@ -175,13 +175,14 @@ public class Robot extends LoggedRobot {
     teleopMode.and(controller.leftTrigger()).whileTrue(shooter.intake());
     teleopMode
         .and(controller.rightTrigger())
-        .whileTrue(shooter.shoot(drive::getDistanceToAllianceHub));
+        .whileTrue(
+            shooter.shoot(drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> DriverStation.isTeleopEnabled() ? -controller.getLeftY() : 0.0,
             () -> DriverStation.isTeleopEnabled() ? -controller.getLeftX() : 0.0,
             () -> DriverStation.isTeleopEnabled() ? -controller.getRightX() : 0.0));
-    teleopMode.and(controller.y()).whileTrue(drive.hubCommand());
+    teleopMode.and(controller.y()).whileTrue(drive.shotAimCommand());
     configureShooterSysIdBindings();
     // controller.y().onTrue(Commands.run(() -> drive.setPose(new Pose2d(0,0, Rotation2d.kZero))));
     autos = new Autos(drive, shooter);
