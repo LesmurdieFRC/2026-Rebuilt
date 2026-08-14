@@ -8,6 +8,8 @@ import edu.wpi.first.wpilibj.Alert;
 import edu.wpi.first.wpilibj.Alert.AlertType;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.Filesystem;
+import edu.wpi.first.wpilibj.PowerDistribution;
+import edu.wpi.first.wpilibj.RobotController;
 import edu.wpi.first.wpilibj.Threads;
 import edu.wpi.first.wpilibj.simulation.DriverStationSim;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
@@ -55,11 +57,27 @@ import org.littletonrobotics.junction.wpilog.WPILOGWriter;
  */
 public class Robot extends LoggedRobot {
   private static final String INTERNAL_TEST_LOG_DIRECTORY = "/home/lvuser/logs";
+  private static final double TELEOP_SHOOT_RPM = 2500.0;
+  private static final Drive.Config COMP_DRIVE_CONFIG =
+      new Drive.Config(
+          TunerConstants.FrontLeft,
+          TunerConstants.FrontRight,
+          TunerConstants.BackLeft,
+          TunerConstants.BackRight,
+          TunerConstants.kSpeedAt12Volts);
+  private static final Drive.Config DEV_DRIVE_CONFIG =
+      new Drive.Config(
+          DevTunerConstants.FrontLeft,
+          DevTunerConstants.FrontRight,
+          DevTunerConstants.BackLeft,
+          DevTunerConstants.BackRight,
+          DevTunerConstants.kSpeedAt12Volts);
 
   private Drive drive;
   private Vision vision;
   private final Superstructure shooter;
   private final CommandXboxController controller = new CommandXboxController(0);
+  private final PowerDistribution powerDistribution = new PowerDistribution();
   private final Alert controllerDisconnected =
       new Alert("Driver controller disconnected!", AlertType.kError);
 
@@ -96,6 +114,14 @@ public class Robot extends LoggedRobot {
     }
 
     Logger.start();
+    CommandScheduler scheduler = CommandScheduler.getInstance();
+    scheduler.onCommandInitialize(this::commandStarted);
+    scheduler.onCommandFinish(this::commandEnded);
+    scheduler.onCommandInterrupt(
+        (interrupted, interrupter) -> {
+          commandEnded(interrupted);
+          interrupter.ifPresent(command -> runningInterrupters.put(command, interrupted));
+        });
     shooter =
         new Superstructure(
             switch (Constants.getMode()) {
@@ -106,13 +132,15 @@ public class Robot extends LoggedRobot {
     if (Constants.getMode() != Constants.Mode.REPLAY) {
       switch (Constants.robotType) {
         case COMP -> {
+          Drive.configureOdometryFrequency(TunerConstants.kCANBus);
           drive =
               new Drive(
-                  new GyroIOPigeon2(),
-                  new ModuleIOTalonFX(TunerConstants.FrontLeft),
-                  new ModuleIOTalonFX(TunerConstants.FrontRight),
-                  new ModuleIOTalonFX(TunerConstants.BackLeft),
-                  new ModuleIOTalonFX(TunerConstants.BackRight));
+                  new GyroIOPigeon2(TunerConstants.DrivetrainConstants),
+                  new ModuleIOTalonFX(TunerConstants.FrontLeft, TunerConstants.kCANBus),
+                  new ModuleIOTalonFX(TunerConstants.FrontRight, TunerConstants.kCANBus),
+                  new ModuleIOTalonFX(TunerConstants.BackLeft, TunerConstants.kCANBus),
+                  new ModuleIOTalonFX(TunerConstants.BackRight, TunerConstants.kCANBus),
+                  COMP_DRIVE_CONFIG);
           vision =
               new Vision(
                   drive::addVisionMeasurement,
@@ -127,13 +155,15 @@ public class Robot extends LoggedRobot {
                       cameraConfigs[3].name(), cameraConfigs[3].robotToCamera()));
         }
         case DEV -> {
+          Drive.configureOdometryFrequency(DevTunerConstants.kCANBus);
           drive =
               new Drive(
-                  new GyroIOPigeon2(),
-                  new ModuleIOTalonFX(DevTunerConstants.FrontLeft),
-                  new ModuleIOTalonFX(DevTunerConstants.FrontRight),
-                  new ModuleIOTalonFX(DevTunerConstants.BackLeft),
-                  new ModuleIOTalonFX(DevTunerConstants.BackRight));
+                  new GyroIOPigeon2(DevTunerConstants.DrivetrainConstants),
+                  new ModuleIOTalonFX(DevTunerConstants.FrontLeft, DevTunerConstants.kCANBus),
+                  new ModuleIOTalonFX(DevTunerConstants.FrontRight, DevTunerConstants.kCANBus),
+                  new ModuleIOTalonFX(DevTunerConstants.BackLeft, DevTunerConstants.kCANBus),
+                  new ModuleIOTalonFX(DevTunerConstants.BackRight, DevTunerConstants.kCANBus),
+                  DEV_DRIVE_CONFIG);
           vision =
               new Vision(
                   drive::addVisionMeasurement,
@@ -154,7 +184,8 @@ public class Robot extends LoggedRobot {
                   new ModuleIOSim(TunerConstants.FrontLeft),
                   new ModuleIOSim(TunerConstants.FrontRight),
                   new ModuleIOSim(TunerConstants.BackLeft),
-                  new ModuleIOSim(TunerConstants.BackRight));
+                  new ModuleIOSim(TunerConstants.BackRight),
+                  COMP_DRIVE_CONFIG);
           vision =
               new Vision(
                   drive::addVisionMeasurement,
@@ -176,7 +207,8 @@ public class Robot extends LoggedRobot {
               new ModuleIO() {},
               new ModuleIO() {},
               new ModuleIO() {},
-              new ModuleIO() {});
+              new ModuleIO() {},
+              COMP_DRIVE_CONFIG);
       vision = new Vision(drive::addVisionMeasurement, drive::getRotation, new VisionIO() {});
     }
 
@@ -186,7 +218,7 @@ public class Robot extends LoggedRobot {
     var teleopMode = RobotModeTriggers.teleop();
     controller.leftTrigger().whileTrue(shooter.intake());
     controller.rightTrigger().whileTrue(shooter.shooter(1500));
-    controller.a().whileTrue(shooter.shooter(6000));
+    controller.a().whileTrue(shooter.shooter(TELEOP_SHOOT_RPM));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> DriverStation.isTeleopEnabled() ? -controller.getLeftY() : 0.0,
@@ -227,6 +259,16 @@ public class Robot extends LoggedRobot {
     Logger.recordOutput(
         "LoggedRobot/MemoryUsageMb",
         (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1e6);
+    Logger.recordOutput("Power/BatteryVoltage", RobotController.getBatteryVoltage());
+    Logger.recordOutput("Power/RioInputVoltage", RobotController.getInputVoltage());
+    Logger.recordOutput("Power/RioInputCurrentAmps", RobotController.getInputCurrent());
+    Logger.recordOutput("Power/BrownoutVoltage", RobotController.getBrownoutVoltage());
+    Logger.recordOutput("Power/IsBrownedOut", RobotController.isBrownedOut());
+    Logger.recordOutput("Power/PDH/Voltage", powerDistribution.getVoltage());
+    Logger.recordOutput("Power/PDH/TotalCurrentAmps", powerDistribution.getTotalCurrent());
+    Logger.recordOutput("Power/PDH/TotalPowerWatts", powerDistribution.getTotalPower());
+    Logger.recordOutput("Power/PDH/TemperatureCelsius", powerDistribution.getTemperature());
+    Logger.recordOutput("Power/PDH/ChannelCurrentAmps", powerDistribution.getAllCurrents());
     Threads.setCurrentThreadPriority(false, 10);
   }
 

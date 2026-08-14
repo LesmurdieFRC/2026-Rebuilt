@@ -21,6 +21,7 @@ import org.littletonrobotics.junction.Logger;
 /** Configures Choreo trajectory following and dashboard autonomous selection. */
 public final class Autos {
   private static final String TRAJECTORY_EXTENSION = ".traj";
+  private static final String FRIDAY_AUTO = "friday_auto";
   private static final String FRIDAY_2_AUTO = "friday2_auto";
   private static final double AUTO_SHOOT_SPEED_RPM = 2500.0;
   private static final double AUTO_SHOOT_DURATION_SECONDS = 2.0;
@@ -44,7 +45,7 @@ public final class Autos {
     for (String trajectoryName : trajectoryNames) {
       System.out.println(trajectoryName);
       chooser.addRoutine(
-          trajectoryName, () -> createTrajectoryRoutine(factory, shooter, trajectoryName));
+          trajectoryName, () -> createTrajectoryRoutine(factory, drive, shooter, trajectoryName));
     }
   }
 
@@ -90,9 +91,12 @@ public final class Autos {
   }
 
   private AutoRoutine createTrajectoryRoutine(
-      AutoFactory factory, Superstructure shooter, String trajectoryName) {
+      AutoFactory factory, Drive drive, Superstructure shooter, String trajectoryName) {
+    if (trajectoryName.equals(FRIDAY_AUTO)) {
+      return createFridayRoutine(factory, drive, shooter);
+    }
     if (trajectoryName.equals(FRIDAY_2_AUTO)) {
-      return createFriday2Routine(factory, shooter);
+      return createFriday2Routine(factory, drive, shooter);
     }
 
     AutoRoutine routine = factory.newRoutine("Choreo: " + trajectoryName);
@@ -110,7 +114,41 @@ public final class Autos {
     return routine;
   }
 
-  private AutoRoutine createFriday2Routine(AutoFactory factory, Superstructure shooter) {
+  private AutoRoutine createFridayRoutine(
+      AutoFactory factory, Drive drive, Superstructure shooter) {
+    AutoRoutine routine = factory.newRoutine("Choreo: " + FRIDAY_AUTO);
+    AutoTrajectory[] segments =
+        new AutoTrajectory[] {
+          routine.trajectory(FRIDAY_AUTO, 0),
+          routine.trajectory(FRIDAY_AUTO, 1),
+          routine.trajectory(FRIDAY_AUTO, 2),
+          routine.trajectory(FRIDAY_AUTO, 3),
+          routine.trajectory(FRIDAY_AUTO, 4)
+        };
+
+    routine
+        .active()
+        .onTrue(
+            Commands.sequence(
+                Commands.runOnce(() -> logTrajectoryStart(FRIDAY_AUTO)),
+                segments[0].resetOdometry(),
+                segments[0].cmd()));
+
+    for (int i = 0; i < segments.length - 1; i++) {
+      int shotNumber = i + 1;
+      AutoTrajectory nextSegment = segments[i + 1];
+      segments[i]
+          .done()
+          .onTrue(
+              stationaryShot(drive, shooter)
+                  .andThen(nextSegment.spawnCmd())
+                  .withName("Shot " + shotNumber + " Then Continue Path"));
+    }
+    return routine;
+  }
+
+  private AutoRoutine createFriday2Routine(
+      AutoFactory factory, Drive drive, Superstructure shooter) {
     AutoRoutine routine = factory.newRoutine("Choreo: " + FRIDAY_2_AUTO);
     AutoTrajectory driveToFirstShot = routine.trajectory(FRIDAY_2_AUTO, 0);
     AutoTrajectory driveToSecondShot = routine.trajectory(FRIDAY_2_AUTO, 1);
@@ -129,24 +167,27 @@ public final class Autos {
     driveToFirstShot
         .done()
         .onTrue(
-            loggedEvent(
-                    "Shoot",
-                    shooter.shooter(AUTO_SHOOT_SPEED_RPM).withTimeout(AUTO_SHOOT_DURATION_SECONDS))
-                .andThen(shooter.stopOnce())
+            stationaryShot(drive, shooter)
                 .andThen(driveToSecondShot.spawnCmd())
                 .withName("First Shot Then Continue Path"));
 
     driveToSecondShot
         .done()
         .onTrue(
-            loggedEvent(
-                    "Shoot",
-                    shooter.shooter(AUTO_SHOOT_SPEED_RPM).withTimeout(AUTO_SHOOT_DURATION_SECONDS))
-                .andThen(shooter.stopOnce())
+            stationaryShot(drive, shooter)
                 .andThen(driveAfterSecondShot.spawnCmd())
                 .withName("Second Shot Then Continue Path"));
 
     return routine;
+  }
+
+  private Command stationaryShot(Drive drive, Superstructure shooter) {
+    return Commands.waitUntil(drive::isStopped)
+        .andThen(
+            loggedEvent(
+                "Shoot",
+                shooter.shooter(AUTO_SHOOT_SPEED_RPM).withTimeout(AUTO_SHOOT_DURATION_SECONDS)))
+        .andThen(shooter.stopOnce());
   }
 
   private Command loggedEvent(String markerName, Command command) {

@@ -1,5 +1,6 @@
 package org.curtinfrc.frc2026.drive.Superstructure;
 
+import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.math.controller.SimpleMotorFeedforward;
 import edu.wpi.first.wpilibj2.command.Command;
@@ -7,6 +8,7 @@ import edu.wpi.first.wpilibj2.command.SubsystemBase;
 import org.littletonrobotics.junction.Logger;
 
 public class Superstructure extends SubsystemBase {
+  private static final double MAX_CONTROL_VOLTS = 12.0;
   private final SuperstructureIO io;
   private final SuperstructureIOInputsAutoLogged inputs = new SuperstructureIOInputsAutoLogged();
   private final PIDController intakeController = new PIDController(0.0003, 0, 0);
@@ -56,19 +58,27 @@ public class Superstructure extends SubsystemBase {
   }
 
   private void setIntakeVelocity(double targetRpm) {
-    io.setIntakeVoltage(
+    double requestedVolts =
         intakeController.calculate(inputs.intakeVelocityRpm, targetRpm)
-            + intakeFeedforward.calculate(targetRpm));
+            + intakeFeedforward.calculate(targetRpm);
+    double commandedVolts = MathUtil.clamp(requestedVolts, -MAX_CONTROL_VOLTS, MAX_CONTROL_VOLTS);
+    io.setIntakeVoltage(commandedVolts);
     Logger.recordOutput("Superstructure/Intake/TargetRPM", targetRpm);
     Logger.recordOutput("Superstructure/Intake/ErrorRPM", intakeController.getError());
+    Logger.recordOutput("Superstructure/Intake/RequestedVolts", requestedVolts);
+    Logger.recordOutput("Superstructure/Intake/CommandedVolts", commandedVolts);
   }
 
   private void setShooterVelocity(double targetRpm) {
-    io.setShooterVoltage(
+    double requestedVolts =
         shooterController.calculate(inputs.shooterVelocityRpm, targetRpm)
-            + shooterFeedforward.calculate(targetRpm));
+            + shooterFeedforward.calculate(targetRpm);
+    double commandedVolts = MathUtil.clamp(requestedVolts, -MAX_CONTROL_VOLTS, MAX_CONTROL_VOLTS);
+    io.setShooterVoltage(commandedVolts);
     Logger.recordOutput("Superstructure/Shooter/TargetRPM", targetRpm);
     Logger.recordOutput("Superstructure/Shooter/ErrorRPM", shooterController.getError());
+    Logger.recordOutput("Superstructure/Shooter/RequestedVolts", requestedVolts);
+    Logger.recordOutput("Superstructure/Shooter/CommandedVolts", commandedVolts);
   }
 
   private void stopMotors() {
@@ -76,5 +86,9 @@ public class Superstructure extends SubsystemBase {
     io.setShooterVoltage(0);
     Logger.recordOutput("Superstructure/Intake/TargetRPM", 0.0);
     Logger.recordOutput("Superstructure/Shooter/TargetRPM", 0.0);
+    Logger.recordOutput("Superstructure/Intake/RequestedVolts", 0.0);
+    Logger.recordOutput("Superstructure/Intake/CommandedVolts", 0.0);
+    Logger.recordOutput("Superstructure/Shooter/RequestedVolts", 0.0);
+    Logger.recordOutput("Superstructure/Shooter/CommandedVolts", 0.0);
   }
 }
