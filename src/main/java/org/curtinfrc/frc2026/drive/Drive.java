@@ -52,6 +52,7 @@ public class Drive extends SubsystemBase {
   private static final double ANGLE_MAX_ACCELERATION = 20.0;
   private static final double WHEEL_RADIUS_MAX_VELOCITY = 0.25; // Rad/Sec
   private static final double WHEEL_RADIUS_RAMP_RATE = 0.05; // Rad/Sec^2
+  private static final double SHOT_ALIGNMENT_RADIUS_METERS = 2.0;
 
   static final Lock odometryLock = new ReentrantLock();
   private final GyroIO gyroIO;
@@ -97,6 +98,8 @@ public class Drive extends SubsystemBase {
   public void followTrajectory(SwerveSample sample) {
     // Get the current pose of the robot
     Pose2d pose = getPose();
+    Logger.recordOutput("Autonomous/Trajectory/ElapsedSeconds", sample.t);
+    Logger.recordOutput("Autonomous/Trajectory/Setpoint", sample.getPose());
 
     // Generate the next speeds for the robot
     ChassisSpeeds fieldRelativeSpeeds =
@@ -337,25 +340,25 @@ public class Drive extends SubsystemBase {
           Rotation2d targetHeading =
               HubAiming.headingToTarget(currentPose.getTranslation(), targetPosition)
                   .rotateBy(new Rotation2d(Math.PI));
-          Translation2d target = new Translation2d();
+          Translation2d alignmentPosition =
+              HubAiming.nearestPointOnCircle(
+                  currentPose.getTranslation(), targetPosition, SHOT_ALIGNMENT_RADIUS_METERS);
 
           double turnSpeed =
               headingController.calculate(
                   currentPose.getRotation().getRadians(), targetHeading.getRadians());
-          if (DriverStation.getAlliance().get() == Alliance.Blue) {
-            target = targetPosition.minus(new Translation2d(2, 0));
-          } else {
-            target = targetPosition.minus(new Translation2d(-2, 0));
-          }
           Logger.recordOutput("Drive/ShotAim/Target", targetPosition);
+          Logger.recordOutput("Drive/ShotAim/AlignmentPosition", alignmentPosition);
           Logger.recordOutput("Drive/ShotAim/TargetHeading", targetHeading);
           Logger.recordOutput(
               "Drive/ShotAim/ReturningToAllianceSide", shotTarget.returnsToAllianceSide());
           runVelocity(
-              new ChassisSpeeds(
-                  xController.calculate(currentPose.getX(), target.getX()),
-                  yController.calculate(currentPose.getY(), target.getY()),
-                  turnSpeed));
+              ChassisSpeeds.fromFieldRelativeSpeeds(
+                  new ChassisSpeeds(
+                      xController.calculate(currentPose.getX(), alignmentPosition.getX()),
+                      yController.calculate(currentPose.getY(), alignmentPosition.getY()),
+                      turnSpeed),
+                  currentPose.getRotation()));
         });
   }
 

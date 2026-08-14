@@ -2,12 +2,14 @@ package org.curtinfrc.frc2026;
 
 import static org.curtinfrc.frc2026.vision.Vision.cameraConfigs;
 
+import edu.wpi.first.hal.AllianceStationID;
 import edu.wpi.first.net.WebServer;
 import edu.wpi.first.wpilibj.Alert;
 import edu.wpi.first.wpilibj.Alert.AlertType;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.Filesystem;
 import edu.wpi.first.wpilibj.Threads;
+import edu.wpi.first.wpilibj.simulation.DriverStationSim;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
@@ -27,6 +29,9 @@ import org.curtinfrc.frc2026.drive.ModuleIO;
 import org.curtinfrc.frc2026.drive.ModuleIOSim;
 import org.curtinfrc.frc2026.drive.ModuleIOTalonFX;
 import org.curtinfrc.frc2026.drive.Superstructure.Superstructure;
+import org.curtinfrc.frc2026.drive.Superstructure.SuperstructureIO;
+import org.curtinfrc.frc2026.drive.Superstructure.SuperstructureIOSim;
+import org.curtinfrc.frc2026.drive.Superstructure.SuperstructureIOSparkMax;
 import org.curtinfrc.frc2026.drive.TunerConstants;
 import org.curtinfrc.frc2026.util.PhoenixUtil;
 import org.curtinfrc.frc2026.util.TestModeWPILOGWriter;
@@ -53,7 +58,7 @@ public class Robot extends LoggedRobot {
 
   private Drive drive;
   private Vision vision;
-  private final Superstructure shooter = new Superstructure();
+  private final Superstructure shooter;
   private final CommandXboxController controller = new CommandXboxController(0);
   private final Alert controllerDisconnected =
       new Alert("Driver controller disconnected!", AlertType.kError);
@@ -91,6 +96,13 @@ public class Robot extends LoggedRobot {
     }
 
     Logger.start();
+    shooter =
+        new Superstructure(
+            switch (Constants.getMode()) {
+              case REAL -> new SuperstructureIOSparkMax();
+              case SIM -> new SuperstructureIOSim();
+              case REPLAY -> new SuperstructureIO() {};
+            });
     if (Constants.getMode() != Constants.Mode.REPLAY) {
       switch (Constants.robotType) {
         case COMP -> {
@@ -259,7 +271,14 @@ public class Robot extends LoggedRobot {
 
   /** This function is called once when the robot is first started up. */
   @Override
-  public void simulationInit() {}
+  public void simulationInit() {
+    // Choreo's AutoChooser only accepts a selection while disabled with a known alliance.
+    // Provide a blue default for simulation; the simulation Driver Station can change it later.
+    if (DriverStation.getAlliance().isEmpty()) {
+      DriverStationSim.setAllianceStationId(AllianceStationID.Blue1);
+      DriverStationSim.notifyNewData();
+    }
+  }
 
   /** This function is called periodically whilst in simulation. */
   @Override
