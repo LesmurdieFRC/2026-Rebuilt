@@ -173,10 +173,7 @@ public class Robot extends LoggedRobot {
     shooter.setDefaultCommand(shooter.stop());
     var teleopMode = RobotModeTriggers.teleop();
     teleopMode.and(controller.leftTrigger()).whileTrue(shooter.intake());
-    teleopMode
-        .and(controller.rightTrigger())
-        .whileTrue(
-            shooter.shoot(drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide));
+    teleopMode.and(controller.rightTrigger()).whileTrue(shooter.shootingCommand());
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> DriverStation.isTeleopEnabled() ? -controller.getLeftY() : 0.0,
