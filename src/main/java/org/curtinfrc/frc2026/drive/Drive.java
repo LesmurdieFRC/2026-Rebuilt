@@ -71,8 +71,8 @@ public class Drive extends SubsystemBase {
       };
   private SwerveDrivePoseEstimator poseEstimator =
       new SwerveDrivePoseEstimator(kinematics, rawGyroRotation, lastModulePositions, Pose2d.kZero);
-  private final PIDController xController = new PIDController(10.0, 0.0, 0.0);
-  private final PIDController yController = new PIDController(10.0, 0.0, 0.0);
+  private final PIDController xController = new PIDController(5.0, 0.0, 0.0);
+  private final PIDController yController = new PIDController(5.0, 0.0, 0.0);
   private final PIDController headingController = new PIDController(7.5, 0.0, 0.0);
 
   public Drive(
@@ -329,24 +329,34 @@ public class Drive extends SubsystemBase {
 
   /** Turns the rear-facing shooter toward its current hub or alliance-side return target. */
   public Command shotAimCommand() {
-    return run(() -> {
+    return run(
+        () -> {
           Pose2d currentPose = getPose();
           ShotTargeting.Target shotTarget = getShotTarget();
           Translation2d targetPosition = shotTarget.position();
           Rotation2d targetHeading =
               HubAiming.headingToTarget(currentPose.getTranslation(), targetPosition)
                   .rotateBy(new Rotation2d(Math.PI));
+          Translation2d target = new Translation2d();
+
           double turnSpeed =
               headingController.calculate(
                   currentPose.getRotation().getRadians(), targetHeading.getRadians());
-
+          if (DriverStation.getAlliance().get() == Alliance.Blue) {
+            target = targetPosition.minus(new Translation2d(2.5, 0));
+          } else {
+            target = targetPosition.minus(new Translation2d(-2.5, 0));
+          }
           Logger.recordOutput("Drive/ShotAim/Target", targetPosition);
           Logger.recordOutput("Drive/ShotAim/TargetHeading", targetHeading);
           Logger.recordOutput(
               "Drive/ShotAim/ReturningToAllianceSide", shotTarget.returnsToAllianceSide());
-          runVelocity(new ChassisSpeeds(0.0, 0.0, turnSpeed));
-        })
-        .withName("Aim Shooter");
+          runVelocity(
+              new ChassisSpeeds(
+                  xController.calculate(currentPose.getX(), target.getX()),
+                  yController.calculate(currentPose.getY(), target.getY()),
+                  turnSpeed));
+        });
   }
 
   /** Returns the center of the scoring hub belonging to the current alliance. */

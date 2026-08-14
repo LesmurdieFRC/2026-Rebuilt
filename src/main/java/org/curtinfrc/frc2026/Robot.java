@@ -26,8 +26,8 @@ import org.curtinfrc.frc2026.drive.GyroIOPigeon2;
 import org.curtinfrc.frc2026.drive.ModuleIO;
 import org.curtinfrc.frc2026.drive.ModuleIOSim;
 import org.curtinfrc.frc2026.drive.ModuleIOTalonFX;
+import org.curtinfrc.frc2026.drive.Superstructure.Superstructure;
 import org.curtinfrc.frc2026.drive.TunerConstants;
-import org.curtinfrc.frc2026.shooter.Shooter;
 import org.curtinfrc.frc2026.util.PhoenixUtil;
 import org.curtinfrc.frc2026.util.TestModeWPILOGWriter;
 import org.curtinfrc.frc2026.util.VirtualSubsystem;
@@ -53,10 +53,11 @@ public class Robot extends LoggedRobot {
 
   private Drive drive;
   private Vision vision;
-  private final Shooter shooter = new Shooter();
+  private final Superstructure shooter = new Superstructure();
   private final CommandXboxController controller = new CommandXboxController(0);
   private final Alert controllerDisconnected =
       new Alert("Driver controller disconnected!", AlertType.kError);
+
   private final Autos autos;
 
   public Robot() {
@@ -170,22 +171,22 @@ public class Robot extends LoggedRobot {
     DriverStation.silenceJoystickConnectionWarning(true);
 
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
-    shooter.setDefaultCommand(shooter.stop());
     var teleopMode = RobotModeTriggers.teleop();
-    teleopMode.and(controller.leftTrigger()).whileTrue(shooter.intake());
-    teleopMode.and(controller.rightTrigger()).whileTrue(shooter.shootingCommand());
+    controller.leftTrigger().whileTrue(shooter.intake());
+    controller.rightTrigger().whileTrue(shooter.shooter(1500));
+    controller.a().whileTrue(shooter.shooter(6000));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> DriverStation.isTeleopEnabled() ? -controller.getLeftY() : 0.0,
             () -> DriverStation.isTeleopEnabled() ? -controller.getLeftX() : 0.0,
             () -> DriverStation.isTeleopEnabled() ? -controller.getRightX() : 0.0));
     teleopMode.and(controller.y()).whileTrue(drive.shotAimCommand());
-    configureShooterSysIdBindings();
+    // configureShooterSysIdBindings();
     // controller.y().onTrue(Commands.run(() -> drive.setPose(new Pose2d(0,0, Rotation2d.kZero))));
     autos = new Autos(drive, shooter);
 
     // Put the auto chooser on the dashboard
-    SmartDashboard.putData(autos.getChooser());
+    SmartDashboard.putData("chooser", autos.getChooser());
 
     // Schedule the selected auto during the autonomous period
     RobotModeTriggers.autonomous().whileTrue(autos.getChooser().selectedCommandScheduler());
@@ -193,11 +194,12 @@ public class Robot extends LoggedRobot {
 
   private void configureShooterSysIdBindings() {
     var testMode = RobotModeTriggers.test();
-    testMode.and(controller.a()).toggleOnTrue(shooter.completeFlywheelSysId());
-    testMode.and(controller.povDown()).whileTrue(shooter.testShootAtRpm(1000.0));
-    testMode.and(controller.povLeft()).whileTrue(shooter.testShootAtRpm(1500.0));
-    testMode.and(controller.povRight()).whileTrue(shooter.testShootAtRpm(2000.0));
-    testMode.and(controller.povUp()).whileTrue(shooter.testShootAtRpm(2500.0));
+    //   testMode.and(controller.a()).toggleOnTrue(shooter.completeFlywheelSysId());
+    //   testMode.and(controller.povDown()).whileTrue(shooter.testShootAtRpm(1000.0));
+    //   testMode.and(controller.povLeft()).whileTrue(shooter.testShootAtRpm(1500.0));
+    //   testMode.and(controller.povRight()).whileTrue(shooter.testShootAtRpm(2000.0));
+    //   testMode.and(controller.povUp()).whileTrue(shooter.testShootAtRpm(2500.0));
+    //
   }
 
   /** This function is called periodically during all modes. */
@@ -236,7 +238,8 @@ public class Robot extends LoggedRobot {
   @Override
   public void teleopInit() {
     // Interrupt any long-running autonomous mechanism event, such as Start Intake.
-    CommandScheduler.getInstance().schedule(shooter.stopOnce());
+    CommandScheduler.getInstance().schedule(shooter.stop().withTimeout(1));
+    shooter.setDefaultCommand(shooter.stop());
   }
 
   /** This function is called periodically during operator control. */

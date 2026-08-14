@@ -40,9 +40,9 @@ final class ShotTargeting {
       double fieldCenterY,
       double fieldWidth,
       double hubWidth) {
-    if (!isBetweenHubs(robotPose.getX(), blueHubX, redHubX)) {
-      return new Target(allianceHub, false);
-    }
+    // if (!isBetweenHubs(robotPose.getX(), blueHubX, redHubX)) {
+    //   return new Target(allianceHub, false);
+    // }
 
     double targetX =
         alliance == Alliance.Red

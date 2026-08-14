@@ -11,7 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import org.curtinfrc.frc2026.drive.Drive;
-import org.curtinfrc.frc2026.shooter.Shooter;
+import org.curtinfrc.frc2026.drive.Superstructure.Superstructure;
 
 /** Configures Choreo trajectory following and dashboard autonomous selection. */
 public final class Autos {
@@ -23,7 +23,7 @@ public final class Autos {
           "No Choreo trajectories found in deploy/choreo; only Do Nothing is available.",
           AlertType.kWarning);
 
-  public Autos(Drive drive, Shooter shooter) {
+  public Autos(Drive drive, Superstructure shooter) {
     AutoFactory factory =
         new AutoFactory(drive::getPose, drive::setPose, drive::followTrajectory, true, drive);
 
@@ -32,6 +32,8 @@ public final class Autos {
     List<String> trajectoryNames = findDeployedTrajectories();
     noTrajectoriesAlert.set(trajectoryNames.isEmpty());
     for (String trajectoryName : trajectoryNames) {
+      System.out.println(trajectoryName);
+
       chooser.addCmd(
           trajectoryName,
           () ->
@@ -50,42 +52,44 @@ public final class Autos {
    * corresponding command. "Start Intake" runs until "Stop Intake", and "Shoot" meters three
    * sensorless shots while waiting for flywheel recovery between each one.
    */
-  private static void configureEventBindings(AutoFactory factory, Drive drive, Shooter shooter) {
+  private static void configureEventBindings(
+      AutoFactory factory, Drive drive, Superstructure shooter) {
     factory
         .bind("Start Intake", shooter.intake())
-        .bind("Stop Intake", shooter.stopOnce())
-        .bind(
-            "Shoot",
-            shooter.shootBurst(
-                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3))
-        // Keep the existing lowercase marker names usable in previously-authored paths.
-        .bind("intake", shooter.intake())
-        .bind("stop", shooter.stopOnce())
-        .bind(
-            "shoot",
-            shooter.shootBurst(
-                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3))
-        .bind(
-            "score",
-            shooter.shootBurst(
-                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 1))
-        .bind(
-            "shoot2",
-            shooter.shootBurst(
-                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 2))
-        .bind(
-            "shoot3",
-            shooter.shootBurst(
-                drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3));
+        .bind("Stop Intake", shooter.stop())
+        .bind("Shoot", shooter.shooter(2500).withTimeout(2));
+    // Keep the existing lowercase marker names usable in previously-authored paths.
+    // .bind("intake", shooter.intake())
+    // .bind("stop", shooter.stopOnce())
+    // .bind(
+    //     "shoot",
+    //     shooter.shootBurst(
+    //         drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3))
+    // .bind(
+    //     "score",
+    //     shooter.shootBurst(
+    //         drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 1))
+    // .bind(
+    //     "shoot2",
+    //     shooter.shootBurst(
+    //         drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 2))
+    // .bind(
+    //     "shoot3",
+    //     shooter.shootBurst(
+    //         drive::getDistanceToShotTarget, drive::isReturningFuelToAllianceSide, 3));
   }
 
   private static List<String> findDeployedTrajectories() {
     Path choreoDirectory = Filesystem.getDeployDirectory().toPath().resolve("choreo");
     if (!Files.isDirectory(choreoDirectory)) {
+      System.out.println(
+          "========================================================================================");
       return List.of();
     }
 
     try (var files = Files.list(choreoDirectory)) {
+      System.out.println("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
       return files
           .filter(Files::isRegularFile)
           .map(path -> path.getFileName().toString())
