@@ -343,9 +343,9 @@ public class Drive extends SubsystemBase {
               headingController.calculate(
                   currentPose.getRotation().getRadians(), targetHeading.getRadians());
           if (DriverStation.getAlliance().get() == Alliance.Blue) {
-            target = targetPosition.minus(new Translation2d(2.5, 0));
+            target = targetPosition.minus(new Translation2d(2, 0));
           } else {
-            target = targetPosition.minus(new Translation2d(-2.5, 0));
+            target = targetPosition.minus(new Translation2d(-2, 0));
           }
           Logger.recordOutput("Drive/ShotAim/Target", targetPosition);
           Logger.recordOutput("Drive/ShotAim/TargetHeading", targetHeading);
