@@ -43,7 +43,7 @@ public class Superstructure extends SubsystemBase {
         .andThen(
             run(
                 () -> {
-                  setIntakeVelocity(-3000);
+                  setIntakeVelocity(3000);
                   setShooterVelocity(speed);
                 }))
         .finallyDo(interrupted -> stopMotors());
