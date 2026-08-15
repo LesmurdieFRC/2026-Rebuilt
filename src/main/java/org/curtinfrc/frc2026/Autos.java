@@ -25,6 +25,7 @@ public final class Autos {
   private static final String FRIDAY_2_AUTO = "friday2_auto";
   private static final double AUTO_SHOOT_SPEED_RPM = 2500.0;
   private static final double AUTO_SHOOT_DURATION_SECONDS = 2.0;
+  private static final double HUMAN_PLAYER_WAIT_SECONDS = 2.0;
 
   private final AutoChooser chooser = new AutoChooser("Do Nothing");
   private final Alert noTrajectoriesAlert =
@@ -123,7 +124,8 @@ public final class Autos {
           routine.trajectory(FRIDAY_AUTO, 1),
           routine.trajectory(FRIDAY_AUTO, 2),
           routine.trajectory(FRIDAY_AUTO, 3),
-          routine.trajectory(FRIDAY_AUTO, 4)
+          routine.trajectory(FRIDAY_AUTO, 4),
+          routine.trajectory(FRIDAY_AUTO, 5)
         };
 
     routine
@@ -134,8 +136,20 @@ public final class Autos {
                 segments[0].resetOdometry(),
                 segments[0].cmd()));
 
-    for (int i = 0; i < segments.length - 1; i++) {
-      int shotNumber = i + 1;
+    segments[0]
+        .done()
+        .onTrue(
+            stationaryShot(drive, shooter)
+                .andThen(segments[1].spawnCmd())
+                .withName("Shot 1 Then Continue Path"));
+    segments[1]
+        .done()
+        .onTrue(
+            humanPlayerWait(drive, shooter)
+                .andThen(segments[2].spawnCmd())
+                .withName("Human Player Wait Then Continue Path"));
+    for (int i = 2; i < segments.length - 1; i++) {
+      int shotNumber = i;
       AutoTrajectory nextSegment = segments[i + 1];
       segments[i]
           .done()
@@ -151,8 +165,9 @@ public final class Autos {
       AutoFactory factory, Drive drive, Superstructure shooter) {
     AutoRoutine routine = factory.newRoutine("Choreo: " + FRIDAY_2_AUTO);
     AutoTrajectory driveToFirstShot = routine.trajectory(FRIDAY_2_AUTO, 0);
-    AutoTrajectory driveToSecondShot = routine.trajectory(FRIDAY_2_AUTO, 1);
-    AutoTrajectory driveAfterSecondShot = routine.trajectory(FRIDAY_2_AUTO, 2);
+    AutoTrajectory driveToHumanPlayer = routine.trajectory(FRIDAY_2_AUTO, 1);
+    AutoTrajectory driveToSecondShot = routine.trajectory(FRIDAY_2_AUTO, 2);
+    AutoTrajectory driveAfterSecondShot = routine.trajectory(FRIDAY_2_AUTO, 3);
 
     routine
         .active()
@@ -168,8 +183,15 @@ public final class Autos {
         .done()
         .onTrue(
             stationaryShot(drive, shooter)
-                .andThen(driveToSecondShot.spawnCmd())
+                .andThen(driveToHumanPlayer.spawnCmd())
                 .withName("First Shot Then Continue Path"));
+
+    driveToHumanPlayer
+        .done()
+        .onTrue(
+            humanPlayerWait(drive, shooter)
+                .andThen(driveToSecondShot.spawnCmd())
+                .withName("Human Player Wait Then Continue Path"));
 
     driveToSecondShot
         .done()
@@ -188,6 +210,15 @@ public final class Autos {
                 "Shoot",
                 shooter.shooter(AUTO_SHOOT_SPEED_RPM).withTimeout(AUTO_SHOOT_DURATION_SECONDS)))
         .andThen(shooter.stopOnce());
+  }
+
+  private Command humanPlayerWait(Drive drive, Superstructure shooter) {
+    return Commands.waitUntil(drive::isStopped)
+        .andThen(
+            loggedEvent(
+                "Human Player Wait",
+                Commands.sequence(
+                    shooter.stopOnce(), Commands.waitSeconds(HUMAN_PLAYER_WAIT_SECONDS))));
   }
 
   private Command loggedEvent(String markerName, Command command) {

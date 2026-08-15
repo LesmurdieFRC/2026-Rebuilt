@@ -6,7 +6,7 @@
     {"x":3.642203330993652, "y":1.5455676317214966, "heading":-3.1264422069422677, "intervals":12, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":2.781019687652588, "y":3.117072820663452, "heading":-2.582993515997654, "intervals":15, "split":true, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":1.3794329166412354, "y":2.06211519241333, "heading":-0.3671736503403036, "intervals":11, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
-    {"x":0.430242657661438, "y":0.6838220357894897, "heading":0.0, "intervals":23, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
+    {"x":0.430242657661438, "y":0.6838220357894897, "heading":0.0, "intervals":23, "split":true, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":2.7033166885375977, "y":3.098508596420288, "heading":-2.652165147461358, "intervals":18, "split":true, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":2.6802642345428467, "y":0.835431694984436, "heading":0.0, "intervals":25, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":7.3339996337890625, "y":0.8412055373191833, "heading":-0.22679838409147057, "intervals":12, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
@@ -47,7 +47,7 @@
     {"x":{"exp":"3.6422033309936523 m", "val":3.642203330993652}, "y":{"exp":"1.5455676317214966 m", "val":1.5455676317214966}, "heading":{"exp":"-3.1264422069422677 rad", "val":-3.1264422069422677}, "intervals":12, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":{"exp":"2.781019687652588 m", "val":2.781019687652588}, "y":{"exp":"3.117072820663452 m", "val":3.117072820663452}, "heading":{"exp":"-2.582993515997654 rad", "val":-2.582993515997654}, "intervals":15, "split":true, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":{"exp":"1.3794329166412354 m", "val":1.3794329166412354}, "y":{"exp":"2.06211519241333 m", "val":2.06211519241333}, "heading":{"exp":"-0.3671736503403036 rad", "val":-0.3671736503403036}, "intervals":11, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
-    {"x":{"exp":"0.430242657661438 m", "val":0.430242657661438}, "y":{"exp":"0.6838220357894897 m", "val":0.6838220357894897}, "heading":{"exp":"0 rad", "val":0.0}, "intervals":23, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
+    {"x":{"exp":"0.430242657661438 m", "val":0.430242657661438}, "y":{"exp":"0.6838220357894897 m", "val":0.6838220357894897}, "heading":{"exp":"0 rad", "val":0.0}, "intervals":23, "split":true, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":{"exp":"2.7033166885375977 m", "val":2.7033166885375977}, "y":{"exp":"3.098508596420288 m", "val":3.098508596420288}, "heading":{"exp":"-2.652165147461358 rad", "val":-2.652165147461358}, "intervals":18, "split":true, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":{"exp":"2.6802642345428467 m", "val":2.6802642345428467}, "y":{"exp":"0.835431694984436 m", "val":0.835431694984436}, "heading":{"exp":"0 deg", "val":0.0}, "intervals":25, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
     {"x":{"exp":"7.3339996337890625 m", "val":7.3339996337890625}, "y":{"exp":"0.8412055373191833 m", "val":0.8412055373191833}, "heading":{"exp":"-0.22679838409147055 rad", "val":-0.22679838409147057}, "intervals":12, "split":false, "fixTranslation":true, "fixHeading":true, "overrideIntervals":false},
@@ -470,7 +470,7 @@
     {"t":17.40522, "x":0.48482, "y":1.02665, "heading":-0.04476, "vx":-0.94877, "vy":-1.00599, "omega":0.86481, "ax":9.1009, "ay":9.76031, "alpha":-8.36216, "fx":[108.1808,78.48461,20.34315,65.44611], "fy":[19.34665,76.97788,108.00452,87.86633]},
     {"t":17.45702, "x":0.44788, "y":0.98763, "heading":-0.01118, "vx":-0.47734, "vy":-0.50041, "omega":0.43166, "ax":9.21521, "ay":9.66044, "alpha":-8.33318, "fx":[108.12166,77.45969,18.58807,71.70715], "fy":[19.85114,78.03908,108.34809,82.96712]},
     {"t":17.50882, "x":0.43552, "y":0.97467, "heading":0.0, "vx":0.0, "vy":0.0, "omega":0.0, "ax":0.0, "ay":0.0, "alpha":0.0, "fx":[0.0,0.0,0.0,0.0], "fy":[0.0,0.0,0.0,0.0]}],
-  "splits":[0,12,61,188,333]
+  "splits":[0,12,38,61,188,333]
  },
  "events":[
    {"name":"Start Intake", "from":{"target":6, "targetTimestamp":5.58399, "offset":{"exp":"0 s", "val":0.0}}, "event":{"type":"named", "data":{"name":"Start Intake"}}},
