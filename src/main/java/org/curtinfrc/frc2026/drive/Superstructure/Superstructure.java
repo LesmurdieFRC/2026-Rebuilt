@@ -13,7 +13,7 @@ public class Superstructure extends SubsystemBase {
   private final SuperstructureIOInputsAutoLogged inputs = new SuperstructureIOInputsAutoLogged();
   private final PIDController intakeController = new PIDController(0.0003, 0, 0);
   private final PIDController shooterController = new PIDController(0.0009, 0, 0);
-  private final SimpleMotorFeedforward intakeFeedforward = new SimpleMotorFeedforward(0.15, 0.0019);
+  private final SimpleMotorFeedforward intakeFeedforward = new SimpleMotorFeedforward(0.25, 0.0019);
   private final SimpleMotorFeedforward shooterFeedforward = new SimpleMotorFeedforward(0.45, 0.004);
 
   public Superstructure(SuperstructureIO io) {
@@ -43,7 +43,7 @@ public class Superstructure extends SubsystemBase {
         .andThen(
             run(
                 () -> {
-                  setIntakeVelocity(-3000);
+                  setIntakeVelocity(-4000);
                   setShooterVelocity(speed);
                 }))
         .finallyDo(interrupted -> stopMotors());
