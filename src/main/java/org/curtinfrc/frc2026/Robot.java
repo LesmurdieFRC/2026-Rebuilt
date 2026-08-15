@@ -3,6 +3,8 @@ package org.curtinfrc.frc2026;
 import static org.curtinfrc.frc2026.vision.Vision.cameraConfigs;
 
 import edu.wpi.first.hal.AllianceStationID;
+import edu.wpi.first.math.geometry.Pose2d;
+import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.net.WebServer;
 import edu.wpi.first.wpilibj.Alert;
 import edu.wpi.first.wpilibj.Alert.AlertType;
@@ -15,6 +17,7 @@ import edu.wpi.first.wpilibj.simulation.DriverStationSim;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
+import edu.wpi.first.wpilibj2.command.Commands;
 import edu.wpi.first.wpilibj2.command.Subsystem;
 import edu.wpi.first.wpilibj2.command.button.CommandXboxController;
 import edu.wpi.first.wpilibj2.command.button.RobotModeTriggers;
@@ -217,8 +220,20 @@ public class Robot extends LoggedRobot {
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
     var teleopMode = RobotModeTriggers.teleop();
     controller.leftTrigger().whileTrue(shooter.intake());
-    controller.rightTrigger().whileTrue(shooter.shooter(1500));
+    controller.rightTrigger().whileTrue(shooter.shooter(2000));
     controller.a().whileTrue(shooter.jam(TELEOP_SHOOT_RPM));
+    teleopMode
+        .and(controller.b())
+        .onTrue(
+            Commands.runOnce(
+                    () -> {
+                      vision.setFusionEnabled(false);
+                      Pose2d currentPose = drive.getPose();
+                      drive.setPose(new Pose2d(currentPose.getTranslation(), Rotation2d.kZero));
+                      Logger.recordOutput("Drive/GyroOnlyMode", true);
+                    },
+                    drive)
+                .withName("Disable Vision And Zero Current Heading"));
     drive.setDefaultCommand(
         drive.joystickDrive(
             () -> DriverStation.isTeleopEnabled() ? -controller.getLeftY() : 0.0,

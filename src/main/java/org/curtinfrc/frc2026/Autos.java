@@ -24,7 +24,7 @@ public final class Autos {
   private static final String FRIDAY_AUTO = "friday_auto";
   private static final String FRIDAY_2_AUTO = "friday2_auto";
   private static final double AUTO_SHOOT_SPEED_RPM = 2500.0;
-  private static final double AUTO_SHOOT_DURATION_SECONDS = 2.0;
+  private static final double AUTO_SHOOT_DURATION_SECONDS = 3.0;
   private static final double HUMAN_PLAYER_WAIT_SECONDS = 2.0;
 
   private final AutoChooser chooser = new AutoChooser("Do Nothing");
@@ -68,7 +68,9 @@ public final class Autos {
             "Shoot",
             loggedEvent(
                 "Shoot",
-                shooter.shooter(AUTO_SHOOT_SPEED_RPM).withTimeout(AUTO_SHOOT_DURATION_SECONDS)))
+                shooter
+                    .autoShooter(-AUTO_SHOOT_SPEED_RPM)
+                    .withTimeout(AUTO_SHOOT_DURATION_SECONDS)))
         .bind("start intake", loggedEvent("start intake", shooter.intake()))
         .bind("end intake", loggedEvent("end intake", shooter.stop()));
     // .bind("intake", shooter.intake())
@@ -208,7 +210,7 @@ public final class Autos {
         .andThen(
             loggedEvent(
                 "Shoot",
-                shooter.shooter(AUTO_SHOOT_SPEED_RPM).withTimeout(AUTO_SHOOT_DURATION_SECONDS)))
+                shooter.autoShooter(AUTO_SHOOT_SPEED_RPM).withTimeout(AUTO_SHOOT_DURATION_SECONDS)))
         .andThen(shooter.stopOnce());
   }
 

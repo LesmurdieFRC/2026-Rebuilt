@@ -9,11 +9,13 @@ import org.littletonrobotics.junction.Logger;
 
 public class Superstructure extends SubsystemBase {
   private static final double MAX_CONTROL_VOLTS = 12.0;
+  private static final double TELEOP_INDEXER_RPM = -4000.0;
+  private static final double AUTO_INDEXER_RPM = -5500.0;
   private final SuperstructureIO io;
   private final SuperstructureIOInputsAutoLogged inputs = new SuperstructureIOInputsAutoLogged();
-  private final PIDController intakeController = new PIDController(0.0003, 0, 0);
+  private final PIDController intakeController = new PIDController(0.0006, 0, 0);
   private final PIDController shooterController = new PIDController(0.0009, 0, 0);
-  private final SimpleMotorFeedforward intakeFeedforward = new SimpleMotorFeedforward(0.25, 0.0019);
+  private final SimpleMotorFeedforward intakeFeedforward = new SimpleMotorFeedforward(0.65, 0.0019);
   private final SimpleMotorFeedforward shooterFeedforward = new SimpleMotorFeedforward(0.45, 0.004);
 
   public Superstructure(SuperstructureIO io) {
@@ -35,15 +37,24 @@ public class Superstructure extends SubsystemBase {
   }
 
   public Command shooter(double speed) {
+    return shooter(speed, 1500.0, TELEOP_INDEXER_RPM);
+  }
+
+  /** Runs the shooter with an auto-only fast feed, holding the indexer still during spin-up. */
+  public Command autoShooter(double speed) {
+    return shooter(speed, 0.0, AUTO_INDEXER_RPM);
+  }
+
+  private Command shooter(double speed, double spinupIndexerRpm, double feedIndexerRpm) {
     return run(() -> {
           setShooterVelocity(speed);
-          setIntakeVelocity(1000);
+          setIntakeVelocity(spinupIndexerRpm);
         })
         .withTimeout(0.67)
         .andThen(
             run(
                 () -> {
-                  setIntakeVelocity(-4000);
+                  setIntakeVelocity(feedIndexerRpm);
                   setShooterVelocity(speed);
                 }))
         .finallyDo(interrupted -> stopMotors());
@@ -52,7 +63,7 @@ public class Superstructure extends SubsystemBase {
   public Command jam(double speed) {
     return run(() -> {
           setShooterVelocity(speed);
-          setIntakeVelocity(-2000);
+          setIntakeVelocity(-3000);
         })
         .finallyDo(interrupted -> stopMotors());
   }

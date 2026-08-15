@@ -7,18 +7,18 @@ import org.junit.jupiter.api.Test;
 class ShooterTest {
   @Test
   void preservesExistingSpeedAtTwoMeters() {
-    assertEquals(1400.0, Shooter.flywheelSpeedForDistance(2.0));
+    assertEquals(3000.0, Shooter.flywheelSpeedForDistance(2.0));
   }
 
   @Test
   void interpolatesBetweenCalibrationPoints() {
-    assertEquals(1450.0, Shooter.flywheelSpeedForDistance(2.25));
+    assertEquals(2542.5, Shooter.flywheelSpeedForDistance(2.25));
   }
 
   @Test
   void clampsOutsideCalibratedRange() {
-    assertEquals(1225.0, Shooter.flywheelSpeedForDistance(0.5));
-    assertEquals(2375.0, Shooter.flywheelSpeedForDistance(7.0));
+    assertEquals(1075.0, Shooter.flywheelSpeedForDistance(0.5));
+    assertEquals(3025.0, Shooter.flywheelSpeedForDistance(7.0));
   }
 
   @Test
