@@ -145,7 +145,7 @@ public final class Autos {
     segments[1]
         .done()
         .onTrue(
-            humanPlayerWait(drive, shooter)
+            humanPlayerWait(segments[1], drive, shooter)
                 .andThen(segments[2].spawnCmd())
                 .withName("Human Player Wait Then Continue Path"));
     for (int i = 2; i < segments.length - 1; i++) {
@@ -189,7 +189,7 @@ public final class Autos {
     driveToHumanPlayer
         .done()
         .onTrue(
-            humanPlayerWait(drive, shooter)
+            humanPlayerWait(driveToHumanPlayer, drive, shooter)
                 .andThen(driveToSecondShot.spawnCmd())
                 .withName("Human Player Wait Then Continue Path"));
 
@@ -212,8 +212,11 @@ public final class Autos {
         .andThen(shooter.stopOnce());
   }
 
-  private Command humanPlayerWait(Drive drive, Superstructure shooter) {
-    return Commands.waitUntil(drive::isStopped)
+  private Command humanPlayerWait(
+      AutoTrajectory arrivalSegment, Drive drive, Superstructure shooter) {
+    return drive
+        .settleToPose(arrivalSegment::getFinalPose)
+        .andThen(Commands.waitUntil(drive::isStopped))
         .andThen(
             loggedEvent(
                 "Human Player Wait",

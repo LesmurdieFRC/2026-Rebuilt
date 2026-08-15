@@ -33,9 +33,11 @@ import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.DriverStation.Alliance;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import java.util.Optional;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.DoubleSupplier;
+import java.util.function.Supplier;
 import org.curtinfrc.frc2026.Constants;
 import org.curtinfrc.frc2026.Constants.Mode;
 import org.curtinfrc.frc2026.util.FieldConstants;
@@ -56,6 +58,15 @@ public class Drive extends SubsystemBase {
   private static final double AIM_MAX_ANGULAR_SPEED_RADIANS_PER_SECOND = 3.0;
   private static final double AIM_LINEAR_ACCELERATION_METERS_PER_SECOND_SQUARED = 2.5;
   private static final double AIM_ANGULAR_ACCELERATION_RADIANS_PER_SECOND_SQUARED = 4.0;
+  private static final double MAX_GYRO_WHEEL_DELTA_DISAGREEMENT_RADIANS = Math.toRadians(20.0);
+  private static final double MAX_ODOMETRY_WHEEL_DELTA_METERS = 0.25;
+  private static final double POSE_SETTLE_MAX_LINEAR_SPEED_METERS_PER_SECOND = 0.75;
+  private static final double POSE_SETTLE_MAX_ANGULAR_SPEED_RADIANS_PER_SECOND = 2.0;
+  private static final double POSE_SETTLE_ACCELERATION_METERS_PER_SECOND_SQUARED = 1.0;
+  private static final double POSE_SETTLE_ANGULAR_ACCELERATION_RADIANS_PER_SECOND_SQUARED = 3.0;
+  private static final double POSE_SETTLE_TRANSLATION_TOLERANCE_METERS = 0.04;
+  private static final double POSE_SETTLE_HEADING_TOLERANCE_RADIANS = Math.toRadians(3.0);
+  private static final double POSE_SETTLE_TIMEOUT_SECONDS = 1.5;
 
   static final Lock odometryLock = new ReentrantLock();
   private final Config config;
@@ -68,6 +79,10 @@ public class Drive extends SubsystemBase {
 
   private final SwerveDriveKinematics kinematics;
   private Rotation2d rawGyroRotation = Rotation2d.kZero;
+  private Rotation2d gyroYawOffset = Rotation2d.kZero;
+  private boolean wasGyroConnected = false;
+  private int gyroRebaseCount = 0;
+  private int moduleOdometryRebaseCount = 0;
   private SwerveModulePosition[] lastModulePositions = // For delta tracking
       new SwerveModulePosition[] {
         new SwerveModulePosition(),
@@ -159,10 +174,12 @@ public class Drive extends SubsystemBase {
     double[] sampleTimestamps =
         modules[0].getOdometryTimestamps(); // All signals are sampled together
     int sampleCount = sampleTimestamps.length;
+    boolean gyroRebasedThisCycle = false;
     for (int i = 0; i < sampleCount; i++) {
       // Read wheel positions and deltas from each module
       SwerveModulePosition[] modulePositions = new SwerveModulePosition[4];
       SwerveModulePosition[] moduleDeltas = new SwerveModulePosition[4];
+      boolean modulePositionJump = false;
       for (int moduleIndex = 0; moduleIndex < 4; moduleIndex++) {
         modulePositions[moduleIndex] = modules[moduleIndex].getOdometryPositions()[i];
         moduleDeltas[moduleIndex] =
@@ -170,17 +187,46 @@ public class Drive extends SubsystemBase {
                 modulePositions[moduleIndex].distanceMeters
                     - lastModulePositions[moduleIndex].distanceMeters,
                 modulePositions[moduleIndex].angle);
+        modulePositionJump |=
+            Math.abs(moduleDeltas[moduleIndex].distanceMeters) > MAX_ODOMETRY_WHEEL_DELTA_METERS;
         lastModulePositions[moduleIndex] = modulePositions[moduleIndex];
       }
 
-      // Update gyro angle
-      if (gyroInputs.connected) {
-        // Use the real gyro angle
-        rawGyroRotation = gyroInputs.odometryYawPositions[i];
+      if (modulePositionJump) {
+        if (gyroInputs.connected && i < gyroInputs.odometryYawPositions.length) {
+          gyroYawOffset = rawGyroRotation.minus(gyroInputs.odometryYawPositions[i]);
+          wasGyroConnected = true;
+        } else {
+          wasGyroConnected = false;
+        }
+        poseEstimator.resetPosition(rawGyroRotation, modulePositions, getPose());
+        moduleOdometryRebaseCount++;
+        continue;
+      }
+
+      Twist2d wheelTwist = kinematics.toTwist2d(moduleDeltas);
+      Rotation2d wheelIntegratedRotation = rawGyroRotation.plus(new Rotation2d(wheelTwist.dtheta));
+
+      // Preserve field-heading continuity if the Pigeon disconnects or reboots during a brownout.
+      if (gyroInputs.connected && i < gyroInputs.odometryYawPositions.length) {
+        Rotation2d sensorYaw = gyroInputs.odometryYawPositions[i];
+        Rotation2d correctedYaw = sensorYaw.plus(gyroYawOffset);
+        double gyroDelta = correctedYaw.minus(rawGyroRotation).getRadians();
+        double disagreement = MathUtil.angleModulus(gyroDelta - wheelTwist.dtheta);
+
+        if (!wasGyroConnected
+            || Math.abs(disagreement) > MAX_GYRO_WHEEL_DELTA_DISAGREEMENT_RADIANS) {
+          rawGyroRotation = wheelIntegratedRotation;
+          gyroYawOffset = rawGyroRotation.minus(sensorYaw);
+          gyroRebaseCount++;
+          gyroRebasedThisCycle = true;
+        } else {
+          rawGyroRotation = correctedYaw;
+        }
+        wasGyroConnected = true;
       } else {
-        // Use the angle delta from the kinematics and module deltas
-        Twist2d twist = kinematics.toTwist2d(moduleDeltas);
-        rawGyroRotation = rawGyroRotation.plus(new Rotation2d(twist.dtheta));
+        rawGyroRotation = wheelIntegratedRotation;
+        wasGyroConnected = false;
       }
 
       // Apply update
@@ -189,6 +235,10 @@ public class Drive extends SubsystemBase {
 
     // Update gyro alert
     gyroDisconnectedAlert.set(!gyroInputs.connected && Constants.getMode() != Mode.SIM);
+    Logger.recordOutput("Drive/Gyro/RebasedThisCycle", gyroRebasedThisCycle);
+    Logger.recordOutput("Drive/Gyro/RebaseCount", gyroRebaseCount);
+    Logger.recordOutput("Drive/Gyro/YawOffsetRadians", gyroYawOffset.getRadians());
+    Logger.recordOutput("Drive/Odometry/ModuleRebaseCount", moduleOdometryRebaseCount);
   }
 
   /**
@@ -250,6 +300,75 @@ public class Drive extends SubsystemBase {
     ChassisSpeeds speeds = getChassisSpeeds();
     return Math.hypot(speeds.vxMetersPerSecond, speeds.vyMetersPerSecond) < 0.10
         && Math.abs(speeds.omegaRadiansPerSecond) < 0.20;
+  }
+
+  /** Converges gently to an alliance-aware trajectory endpoint before a stationary auto action. */
+  public Command settleToPose(Supplier<Optional<Pose2d>> targetSupplier) {
+    SlewRateLimiter xLimiter =
+        new SlewRateLimiter(POSE_SETTLE_ACCELERATION_METERS_PER_SECOND_SQUARED);
+    SlewRateLimiter yLimiter =
+        new SlewRateLimiter(POSE_SETTLE_ACCELERATION_METERS_PER_SECOND_SQUARED);
+    SlewRateLimiter omegaLimiter =
+        new SlewRateLimiter(POSE_SETTLE_ANGULAR_ACCELERATION_RADIANS_PER_SECOND_SQUARED);
+
+    return run(() -> {
+          Optional<Pose2d> target = targetSupplier.get();
+          if (target.isEmpty()) {
+            stop();
+            return;
+          }
+
+          Pose2d currentPose = getPose();
+          Pose2d targetPose = target.get();
+          double xSpeed =
+              xLimiter.calculate(
+                  MathUtil.clamp(
+                      xController.calculate(currentPose.getX(), targetPose.getX()),
+                      -POSE_SETTLE_MAX_LINEAR_SPEED_METERS_PER_SECOND,
+                      POSE_SETTLE_MAX_LINEAR_SPEED_METERS_PER_SECOND));
+          double ySpeed =
+              yLimiter.calculate(
+                  MathUtil.clamp(
+                      yController.calculate(currentPose.getY(), targetPose.getY()),
+                      -POSE_SETTLE_MAX_LINEAR_SPEED_METERS_PER_SECOND,
+                      POSE_SETTLE_MAX_LINEAR_SPEED_METERS_PER_SECOND));
+          double omega =
+              omegaLimiter.calculate(
+                  MathUtil.clamp(
+                      headingController.calculate(
+                          currentPose.getRotation().getRadians(),
+                          targetPose.getRotation().getRadians()),
+                      -POSE_SETTLE_MAX_ANGULAR_SPEED_RADIANS_PER_SECOND,
+                      POSE_SETTLE_MAX_ANGULAR_SPEED_RADIANS_PER_SECOND));
+          runVelocity(
+              ChassisSpeeds.fromFieldRelativeSpeeds(
+                  new ChassisSpeeds(xSpeed, ySpeed, omega), currentPose.getRotation()));
+          Logger.recordOutput("Autonomous/PoseSettle/Target", targetPose);
+        })
+        .beforeStarting(
+            () -> {
+              xLimiter.reset(0.0);
+              yLimiter.reset(0.0);
+              omegaLimiter.reset(0.0);
+            })
+        .until(
+            () ->
+                targetSupplier
+                    .get()
+                    .map(
+                        target ->
+                            getPose().getTranslation().getDistance(target.getTranslation())
+                                    < POSE_SETTLE_TRANSLATION_TOLERANCE_METERS
+                                && Math.abs(
+                                        getPose()
+                                            .getRotation()
+                                            .minus(target.getRotation())
+                                            .getRadians())
+                                    < POSE_SETTLE_HEADING_TOLERANCE_RADIANS)
+                    .orElse(false))
+        .withTimeout(POSE_SETTLE_TIMEOUT_SECONDS)
+        .finallyDo(interrupted -> stop())
+        .withName("Settle To Auto Pose");
   }
 
   /** Returns the position of each module in radians. */
@@ -392,6 +511,9 @@ public class Drive extends SubsystemBase {
           Rotation2d targetHeading =
               HubAiming.headingToTarget(currentPose.getTranslation(), targetPosition)
                   .rotateBy(new Rotation2d(Math.PI));
+          if (DriverStation.getAlliance().orElse(Alliance.Blue) == Alliance.Red) {
+            targetHeading = targetHeading.rotateBy(Rotation2d.kPi);
+          }
           Translation2d alignmentPosition =
               HubAiming.nearestPointOnCircle(
                   currentPose.getTranslation(), targetPosition, SHOT_ALIGNMENT_RADIUS_METERS);
