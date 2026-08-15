@@ -49,6 +49,14 @@ public class Superstructure extends SubsystemBase {
         .finallyDo(interrupted -> stopMotors());
   }
 
+  public Command jam(double speed) {
+    return run(() -> {
+          setShooterVelocity(speed);
+          setIntakeVelocity(-2000);
+        })
+        .finallyDo(interrupted -> stopMotors());
+  }
+
   public Command stop() {
     return run(this::stopMotors);
   }
