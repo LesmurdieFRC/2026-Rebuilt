@@ -220,7 +220,7 @@ public class Robot extends LoggedRobot {
     WebServer.start(5800, Filesystem.getDeployDirectory().getPath());
     var teleopMode = RobotModeTriggers.teleop();
     controller.leftTrigger().whileTrue(shooter.intake());
-    controller.rightTrigger().whileTrue(shooter.shooter(2000));
+    controller.rightTrigger().whileTrue(shooter.shooter(2050));
     controller.a().whileTrue(shooter.jam(TELEOP_SHOOT_RPM));
     teleopMode
         .and(controller.b())

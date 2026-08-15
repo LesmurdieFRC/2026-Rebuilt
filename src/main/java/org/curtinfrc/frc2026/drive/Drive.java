@@ -51,7 +51,7 @@ public class Drive extends SubsystemBase {
   private static final double ANGLE_MAX_ACCELERATION = 20.0;
   private static final double WHEEL_RADIUS_MAX_VELOCITY = 0.2; // Rad/Sec
   private static final double WHEEL_RADIUS_RAMP_RATE = 0.05; // Rad/Sec^2
-  private static final double SHOT_ALIGNMENT_RADIUS_METERS = 2.5;
+  private static final double SHOT_ALIGNMENT_RADIUS_METERS = 2;
   private static final double JOYSTICK_TRANSLATION_SLEW_RATE_PER_SECOND = 2.5;
   private static final double JOYSTICK_ROTATION_SLEW_RATE_PER_SECOND = 3.0;
   private static final double AIM_MAX_LINEAR_SPEED_METERS_PER_SECOND = 2.0;

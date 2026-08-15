@@ -9,7 +9,7 @@ import org.littletonrobotics.junction.Logger;
 
 public class Superstructure extends SubsystemBase {
   private static final double MAX_CONTROL_VOLTS = 12.0;
-  private static final double TELEOP_INDEXER_RPM = -4000.0;
+  private static final double TELEOP_INDEXER_RPM = -4500.0;
   private static final double AUTO_INDEXER_RPM = -5500.0;
   private final SuperstructureIO io;
   private final SuperstructureIOInputsAutoLogged inputs = new SuperstructureIOInputsAutoLogged();
@@ -31,13 +31,13 @@ public class Superstructure extends SubsystemBase {
   public Command intake() {
     return run(
         () -> {
-          setIntakeVelocity(1000);
-          setShooterVelocity(1400);
+          setIntakeVelocity(1500);
+          setShooterVelocity(2000);
         });
   }
 
   public Command shooter(double speed) {
-    return shooter(speed, 1500.0, TELEOP_INDEXER_RPM);
+    return shooter(speed, 3000.0, TELEOP_INDEXER_RPM);
   }
 
   /** Runs the shooter with an auto-only fast feed, holding the indexer still during spin-up. */
